@@ -1,0 +1,35 @@
+{
+  "name": "clawmd-hub-node-client",
+  "version": "0.1.0",
+  "description": "ClawMd Hub cross-platform Node client for AI Markdown knowledge-base sync",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": [
+    "clawmd-hub",
+    "markdown",
+    "ai",
+    "obsidian",
+    "sync",
+    "node",
+    "desktop",
+    "realtime"
+  ],
+  "author": "Ray",
+  "license": "MIT",
+  "dependencies": {
+    "chokidar": "^3.5.3",
+    "dotenv": "^16.0.3",
+    "node-fetch": "^2.7.0",
+    "socket.io-client": "^4.6.1",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
