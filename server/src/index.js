@@ -64,22 +64,33 @@ async function saveFileToServer(filePath, content) {
 async function deleteFileFromServer(filePath) {
   const fullPath = path.join(STORAGE_PATH, filePath);
   const trashPath = path.join(STORAGE_PATH, '.trash', filePath);
+  const trashKey = `trash:${filePath}`;
+  const trashRecord = {
+    originalPath: filePath,
+    deletedAt: Date.now(),
+    expireAt: Date.now() + 30 * 86400 * 1000
+  };
   try {
     await fs.mkdir(path.dirname(trashPath), { recursive: true });
     await fs.rename(fullPath, trashPath);
-    const trashKey = `trash:${filePath}`;
-    await redisClient.set(
-      trashKey,
-      JSON.stringify({
-        originalPath: filePath,
-        deletedAt: Date.now(),
-        expireAt: Date.now() + 30 * 86400 * 1000
-      }),
-      { EX: 86400 * 30 }
-    );
+    await redisClient.set(trashKey, JSON.stringify(trashRecord), { EX: 86400 * 30 });
     console.log(`🗑️  软删除: ${filePath} → .trash/`);
+    return { deleted: true, alreadyDeleted: false };
   } catch (error) {
+    if (error.code === 'ENOENT') {
+      try {
+        await fs.access(trashPath);
+        await redisClient.set(trashKey, JSON.stringify(trashRecord), { EX: 86400 * 30 });
+        console.log(`🗑️  已软删除，跳过重复删除: ${filePath}`);
+        return { deleted: true, alreadyDeleted: true };
+      } catch {
+        console.log(`🗑️  文件已不存在，标记删除: ${filePath}`);
+        await redisClient.del(`file:hash:${filePath}`);
+        return { deleted: false, alreadyDeleted: true };
+      }
+    }
     console.error(`❌ 软删除失败: ${filePath}`, error.message);
+    throw error;
   }
 }
 io.on('connection', (socket) => {
