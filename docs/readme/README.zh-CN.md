@@ -1,6 +1,6 @@
 # ClawMd Hub
 
-[English](../../README.md) · 简体中文
+[English](../../README.md) · [简体中文](README.zh-CN.md)
 
 ClawMd Hub 是一个面向 AI 工作流的 Markdown 资料库同步中枢。它会监听本地文件变化，并以毫秒级延迟自动触发同步到 Node 运行环境、云端服务器以及未来的 iOS/Android 客户端，帮助 Claude、Codex、OpenClaw 使用同一份最新的 AI 上下文资料层。文件删除会同步为服务端软删除状态。ClawMd Hub 不提供版本回滚能力，因此更适合配合 Git 使用，由 Git 负责持久化历史版本和回滚。
 
@@ -149,3 +149,7 @@ ClawMd Hub 基于 MIT License 完全开源。你可以免费使用、复制、�
 ## License
 
 [MIT](../../LICENSE)
+
+## 友情链接
+
+[Linux do](https://linux.do/)

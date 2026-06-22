@@ -1,6 +1,6 @@
 # ClawMd Hub
 
-English · [简体中文](docs/readme/README.zh-CN.md)
+[English](README.md) · [简体中文](docs/readme/README.zh-CN.md)
 
 ClawMd Hub is a Markdown knowledge-base sync hub for AI workflows. It watches local files and triggers sync automatically at millisecond-level latency across Node runtimes, cloud servers, and future iOS/Android clients, helping Claude, Codex, and OpenClaw use the same up-to-date AI context layer. Deleted files are synced as soft-delete state on the server. ClawMd Hub does not provide version rollback, so it is best used together with Git for durable history and rollback.
 
@@ -149,3 +149,7 @@ The software is provided as-is without warranty. Keep private configuration, sec
 ## License
 
 [MIT](LICENSE)
+
+## Friendly Links
+
+[Linux do](https://linux.do/)
