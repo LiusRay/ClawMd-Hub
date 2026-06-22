@@ -95,6 +95,8 @@ ClawMd Hub is designed to grow into a plugin-based Markdown knowledge hub:
 
 ## Roadmap
 
+The roadmap describes planned development directions, not features that are already fully available in the current release. Items may change as the project evolves.
+
 ### v0.3 Stability
 
 - Improve download and retry behavior
