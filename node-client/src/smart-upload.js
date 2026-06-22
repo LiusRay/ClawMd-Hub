@@ -10,7 +10,8 @@ function calculateStrategy(files, totalSizeMB) {
       description: `${fileCount}个文件直接并发上传`
     };
   }
-  const batchSize = 50;
+  const batchSize = parseInt(process.env.UPLOAD_BATCH_SIZE || '10', 10);
+  const maxBatchSizeMB = parseFloat(process.env.UPLOAD_BATCH_MAX_MB || '20');
   let concurrency;
   if (totalSizeMB < 100) {
     concurrency = 3;
@@ -23,8 +24,36 @@ function calculateStrategy(files, totalSizeMB) {
     mode: 'batch',
     concurrency,
     batchSize,
-    description: `每批${batchSize}个，${concurrency}批并发`
+    maxBatchSizeMB,
+    description: `每批最多${batchSize}个或${maxBatchSizeMB}MB，${concurrency}批并发`
   };
+}
+async function createBatches(files, RAY_PATH, batchSize, maxBatchSizeMB) {
+  const batches = [];
+  let currentBatch = [];
+  let currentSizeMB = 0;
+  for (const filePath of files) {
+    let sizeMB = 0;
+    try {
+      const stats = await fs.stat(path.join(RAY_PATH, filePath));
+      sizeMB = stats.size / 1024 / 1024;
+    } catch (error) {
+    }
+    const shouldStartNewBatch =
+      currentBatch.length > 0 &&
+      (currentBatch.length >= batchSize || currentSizeMB + sizeMB > maxBatchSizeMB);
+    if (shouldStartNewBatch) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentSizeMB = 0;
+    }
+    currentBatch.push(filePath);
+    currentSizeMB += sizeMB;
+  }
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+  return batches;
 }
 async function smartUpload(filesToUpload, RAY_PATH, uploadFn) {
   console.log('🧠 智能上传分析中...\n');
@@ -87,14 +116,11 @@ async function uploadSingle(files, RAY_PATH, uploadFn, concurrency) {
 }
 async function uploadBatch(files, RAY_PATH, uploadFn, strategy) {
   console.log(`🚀 开始批次并发上传...\n`);
-  const { batchSize, concurrency } = strategy;
+  const { batchSize, concurrency, maxBatchSizeMB } = strategy;
   let uploaded = 0;
   const results = { succeeded: 0, failed: 0 };
-  const batches = [];
-  for (let i = 0; i < files.length; i += batchSize) {
-    batches.push(files.slice(i, i + batchSize));
-  }
-  console.log(`📦 已分为 ${batches.length} 批，每批约 ${batchSize} 个文件\n`);
+  const batches = await createBatches(files, RAY_PATH, batchSize, maxBatchSizeMB);
+  console.log(`📦 已分为 ${batches.length} 批，每批最多 ${batchSize} 个文件或 ${maxBatchSizeMB}MB\n`);
   for (let i = 0; i < batches.length; i += concurrency) {
     const concurrentBatches = batches.slice(i, i + concurrency);
     console.log(`🔄 正在并发上传第 ${i + 1}-${Math.min(i + concurrency, batches.length)} 批...\n`);
@@ -125,15 +151,18 @@ async function uploadBatch(files, RAY_PATH, uploadFn, strategy) {
             console.error(`   ❌ 读取失败: ${filePath}`);
           }
         }
-        const result = await uploadFn(batchFiles);
+        const result = await uploadPreparedBatch(uploadFn, batchFiles);
         batchFiles.length = 0;
         uploaded += result.succeeded;
         results.succeeded += result.succeeded;
         results.failed += result.failed;
         console.log(`   ✅ 批次${batchNum}: ${result.succeeded}/${batch.length} 成功 (${batchSizeMB.toFixed(1)}MB)`);
       } catch (error) {
-        console.error(`   ❌ 批次${batchNum}失败: ${error.message}`);
-        results.failed += batch.length;
+        console.error(`   ❌ 批次${batchNum}失败，尝试拆分上传: ${error.message}`);
+        const splitResult = await uploadSplitBatch(batch, RAY_PATH, uploadFn);
+        uploaded += splitResult.succeeded;
+        results.succeeded += splitResult.succeeded;
+        results.failed += splitResult.failed;
       }
     });
     await Promise.all(promises);
@@ -143,6 +172,46 @@ async function uploadBatch(files, RAY_PATH, uploadFn, strategy) {
     }
   }
   console.log(`\n✅ 上传完成！成功: ${results.succeeded}, 失败: ${results.failed}\n`);
+  return results;
+}
+async function uploadPreparedBatch(uploadFn, batchFiles) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await uploadFn(batchFiles);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+      }
+    }
+  }
+  throw lastError;
+}
+async function uploadSplitBatch(batch, RAY_PATH, uploadFn) {
+  const results = { succeeded: 0, failed: 0 };
+  for (const filePath of batch) {
+    try {
+      const fullPath = path.join(RAY_PATH, filePath);
+      const content = await fs.readFile(fullPath, 'utf8');
+      const crypto = require('crypto');
+      const hash = crypto.createHash('md5').update(content).digest('hex');
+      const stats = await fs.stat(fullPath);
+      const result = await uploadPreparedBatch(uploadFn, [{
+        filePath,
+        content,
+        operation: 'create',
+        hash,
+        mtime: stats.mtimeMs,
+        baseHash: null
+      }]);
+      results.succeeded += result.succeeded;
+      results.failed += result.failed;
+    } catch (error) {
+      results.failed++;
+      console.error(`      ❌ 拆分上传失败: ${filePath}: ${error.message}`);
+    }
+  }
   return results;
 }
 module.exports = { smartUpload };
