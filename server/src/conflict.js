@@ -103,8 +103,9 @@ async function handleConflict(filePath, content, deviceId, saveFileToServer) {
     console.log(`⚠️  检测到冲突: ${filePath}`);
     console.log(`📝 生成冲突副本: ${conflictPath}`);
     await saveFileToServer(conflictPath, content);
-    const hash = crypto.createHash('md5').update(content).digest('hex');
-    const size = Buffer.byteLength(content, 'utf8');
+    const contentBuffer = Buffer.isBuffer(content) ? content : Buffer.from(content || '', 'utf8');
+    const hash = crypto.createHash('md5').update(contentBuffer).digest('hex');
+    const size = contentBuffer.length;
     await db.collection('files').insertOne({
       path: conflictPath,
       hash,

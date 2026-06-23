@@ -59,7 +59,16 @@ async function findPeerDevices(currentDeviceId, localIP) {
 async function saveFileToServer(filePath, content) {
   const fullPath = path.join(STORAGE_PATH, filePath);
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
-  await fs.writeFile(fullPath, content, 'utf8');
+  await fs.writeFile(fullPath, content);
+}
+function decodeFileContent(content, contentEncoding) {
+  if (Buffer.isBuffer(content)) {
+    return content;
+  }
+  if (contentEncoding === 'base64') {
+    return Buffer.from(content || '', 'base64');
+  }
+  return Buffer.from(content || '', 'utf8');
 }
 async function deleteFileFromServer(filePath) {
   const fullPath = path.join(STORAGE_PATH, filePath);
@@ -137,7 +146,7 @@ io.on('connection', (socket) => {
     if (!authenticated) {
       console.log(`⚠️  收到未认证连接的文件上传，尝试从数据中验证...`);
     }
-    const { filePath, operation, content, deviceId, isInitialSync } = data;
+    const { filePath, operation, content, contentEncoding, deviceId, isInitialSync } = data;
     if (!isInitialSync) {
       console.log(`📝 文件变更: ${filePath} (${operation}) from ${deviceId}`);
     }
@@ -145,6 +154,7 @@ io.on('connection', (socket) => {
       filePath,
       operation,
       content,
+      contentEncoding,
       fromDevice: deviceId,
       timestamp: Date.now()
     });
@@ -160,10 +170,11 @@ io.on('connection', (socket) => {
           console.log(`🗑️  已删除服务器文件: ${filePath}`);
         }
       } else {
-        await saveFileToServer(filePath, content);
+        const contentBuffer = decodeFileContent(content, contentEncoding);
+        await saveFileToServer(filePath, contentBuffer);
         const crypto = require('crypto');
-        const hash = crypto.createHash('md5').update(content).digest('hex');
-        const size = Buffer.byteLength(content, 'utf8');
+        const hash = crypto.createHash('md5').update(contentBuffer).digest('hex');
+        const size = contentBuffer.length;
         const db = getDb();
         await db.collection('files').updateOne(
           { path: filePath },
@@ -224,7 +235,7 @@ app.post('/upload', async (req, res) => {
     const db = getDb();
     const results = [];
     for (const file of files) {
-      const { filePath, content, operation, hash: clientHash, baseHash, mtime: clientMtime } = file;
+      const { filePath, content, contentEncoding, operation, hash: clientHash, baseHash, mtime: clientMtime } = file;
       try {
         if (operation === 'delete') {
           await deleteFileFromServer(filePath);
@@ -245,7 +256,7 @@ app.post('/upload', async (req, res) => {
           if (conflictDetection.conflict) {
             const { conflictPath, conflict } = await handleConflict(
               filePath,
-              content,
+              decodeFileContent(content, contentEncoding),
               deviceId,
               saveFileToServer
             );
@@ -271,9 +282,10 @@ app.post('/upload', async (req, res) => {
               timestamp: Date.now()
             });
           } else {
-            await saveFileToServer(filePath, content);
-            const hash = clientHash || crypto.createHash('md5').update(content).digest('hex');
-            const size = Buffer.byteLength(content, 'utf8');
+            const contentBuffer = decodeFileContent(content, contentEncoding);
+            await saveFileToServer(filePath, contentBuffer);
+            const hash = clientHash || crypto.createHash('md5').update(contentBuffer).digest('hex');
+            const size = contentBuffer.length;
             await redisClient.set(
               `file:hash:${filePath}`,
               JSON.stringify({ hash, size, mtime: Date.now() }),
@@ -356,8 +368,8 @@ app.get('/download/:path(*)', async (req, res) => {
     }
     const fullPath = path.join(STORAGE_PATH, filePath);
     try {
-      const content = await fs.readFile(fullPath, 'utf8');
-      res.send(content);
+      const content = await fs.readFile(fullPath);
+      res.type('application/octet-stream').send(content);
     } catch (error) {
       res.status(404).json({ error: '文件不存在' });
     }

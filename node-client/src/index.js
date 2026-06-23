@@ -266,7 +266,7 @@ async function downloadFile(filePath) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
-      return await response.text();
+      return await response.buffer();
 
     } catch (error) {
       const isLastAttempt = attempt === maxRetries;
@@ -363,7 +363,7 @@ async function startInitialSync() {
         
         await fs.mkdir(path.dirname(fullPath), { recursive: true });
         
-        await fs.writeFile(fullPath, content, 'utf8');
+        await fs.writeFile(fullPath, content);
         
         downloaded++;
         
@@ -455,14 +455,17 @@ socket.on('file:update', async (data) => {
         const latestContent = await downloadFile(filePath);
         const dir = path.dirname(fullPath);
         await fs.mkdir(dir, { recursive: true });
-        await fs.writeFile(fullPath, latestContent, 'utf8');
+        await fs.writeFile(fullPath, latestContent);
         console.log(`💾 已保存: ${filePath}`);
       } catch (error) {
         console.error(`❌ 下载失败，使用通知中的内容: ${filePath}`);
         if (content) {
           const dir = path.dirname(fullPath);
           await fs.mkdir(dir, { recursive: true });
-          await fs.writeFile(fullPath, content, 'utf8');
+          const fallbackContent = data.contentEncoding === 'base64'
+            ? Buffer.from(content, 'base64')
+            : Buffer.from(content, 'utf8');
+          await fs.writeFile(fullPath, fallbackContent);
           console.log(`💾 已保存（降级）: ${filePath}`);
         }
       }
@@ -491,7 +494,7 @@ socket.on('conflict:detected', async (data) => {
       syncingFiles.add(fullPath);
 
       await fs.mkdir(path.dirname(fullPath), { recursive: true });
-      await fs.writeFile(fullPath, content, 'utf8');
+      await fs.writeFile(fullPath, content);
 
       console.log(`✅ 冲突副本已下载到本地: ${conflictPath}\n`);
       console.log(`💡 请手动合并冲突后删除副本\n`);
@@ -578,12 +581,17 @@ async function handleFileChange(fullPath, operation) {
         console.log(`✅ 删除已同步: ${relativePath}`);
       }
     } else {
-      const content = await fs.readFile(fullPath, 'utf8');
+      const contentBuffer = await fs.readFile(fullPath);
+      const crypto = require('crypto');
+      const stats = await fs.stat(fullPath);
       
       socket.emit('file:changed', {
         filePath: relativePath,
         operation,
-        content,
+        content: contentBuffer.toString('base64'),
+        contentEncoding: 'base64',
+        hash: crypto.createHash('md5').update(contentBuffer).digest('hex'),
+        mtime: stats.mtimeMs,
         deviceId: DEVICE_ID
       });
 

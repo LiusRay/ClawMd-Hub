@@ -1,5 +1,21 @@
 const fs = require('fs').promises;
 const path = require('path');
+const crypto = require('crypto');
+async function buildUploadFile(RAY_PATH, filePath) {
+  const fullPath = path.join(RAY_PATH, filePath);
+  const contentBuffer = await fs.readFile(fullPath);
+  const stats = await fs.stat(fullPath);
+  return {
+    filePath,
+    content: contentBuffer.toString('base64'),
+    contentEncoding: 'base64',
+    operation: 'create',
+    hash: crypto.createHash('md5').update(contentBuffer).digest('hex'),
+    mtime: stats.mtimeMs,
+    baseHash: null,
+    size: contentBuffer.length
+  };
+}
 function calculateStrategy(files, totalSizeMB) {
   const fileCount = files.length;
   if (fileCount <= 20) {
@@ -87,20 +103,7 @@ async function uploadSingle(files, RAY_PATH, uploadFn, concurrency) {
     const batch = files.slice(i, i + concurrency);
     const promises = batch.map(async (filePath) => {
       try {
-        const fullPath = path.join(RAY_PATH, filePath);
-        const content = await fs.readFile(fullPath, 'utf8');
-        const crypto = require('crypto');
-        const hash = crypto.createHash('md5').update(content).digest('hex');
-        const stats = await fs.stat(fullPath);
-        const mtime = stats.mtimeMs;
-        await uploadFn([{
-          filePath,
-          content,
-          operation: 'create',
-          hash,
-          mtime,
-          baseHash: null
-        }]);
+        await uploadFn([await buildUploadFile(RAY_PATH, filePath)]);
         results.succeeded++;
         uploaded++;
         console.log(`   ✅ [${uploaded}/${files.length}] ${filePath}`);
@@ -132,20 +135,9 @@ async function uploadBatch(files, RAY_PATH, uploadFn, strategy) {
         for (const filePath of batch) {
           try {
             const fullPath = path.join(RAY_PATH, filePath);
-            const content = await fs.readFile(fullPath, 'utf8');
-            const sizeMB = Buffer.byteLength(content, 'utf8') / 1024 / 1024;
-            const crypto = require('crypto');
-            const hash = crypto.createHash('md5').update(content).digest('hex');
             const stats = await fs.stat(fullPath);
-            const mtime = stats.mtimeMs;
-            batchFiles.push({
-              filePath,
-              content,
-              operation: 'create',
-              hash,
-              mtime,
-              baseHash: null
-            });
+            const sizeMB = stats.size / 1024 / 1024;
+            batchFiles.push(await buildUploadFile(RAY_PATH, filePath));
             batchSizeMB += sizeMB;
           } catch (error) {
             console.error(`   ❌ 读取失败: ${filePath}`);
@@ -192,19 +184,7 @@ async function uploadSplitBatch(batch, RAY_PATH, uploadFn) {
   const results = { succeeded: 0, failed: 0 };
   for (const filePath of batch) {
     try {
-      const fullPath = path.join(RAY_PATH, filePath);
-      const content = await fs.readFile(fullPath, 'utf8');
-      const crypto = require('crypto');
-      const hash = crypto.createHash('md5').update(content).digest('hex');
-      const stats = await fs.stat(fullPath);
-      const result = await uploadPreparedBatch(uploadFn, [{
-        filePath,
-        content,
-        operation: 'create',
-        hash,
-        mtime: stats.mtimeMs,
-        baseHash: null
-      }]);
+      const result = await uploadPreparedBatch(uploadFn, [await buildUploadFile(RAY_PATH, filePath)]);
       results.succeeded += result.succeeded;
       results.failed += result.failed;
     } catch (error) {
