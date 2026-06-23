@@ -13,7 +13,8 @@ async function buildUploadFile(RAY_PATH, filePath) {
     hash: crypto.createHash('md5').update(contentBuffer).digest('hex'),
     mtime: stats.mtimeMs,
     baseHash: null,
-    size: contentBuffer.length
+    size: contentBuffer.length,
+    force: true
   };
 }
 function calculateStrategy(files, totalSizeMB) {

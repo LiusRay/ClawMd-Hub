@@ -235,7 +235,7 @@ app.post('/upload', async (req, res) => {
     const db = getDb();
     const results = [];
     for (const file of files) {
-      const { filePath, content, contentEncoding, operation, hash: clientHash, baseHash, mtime: clientMtime } = file;
+      const { filePath, content, contentEncoding, operation, hash: clientHash, baseHash, mtime: clientMtime, force } = file;
       try {
         if (operation === 'delete') {
           await deleteFileFromServer(filePath);
@@ -246,13 +246,20 @@ app.post('/upload', async (req, res) => {
           await redisClient.del(`file:hash:${filePath}`);
           results.push({ filePath, success: true, action: 'deleted' });
         } else {
-          const conflictDetection = await detectConflict(
-            filePath,
-            clientHash,
-            clientMtime,
-            baseHash,
-            deviceId
-          );
+          let conflictDetection = {
+            conflict: false,
+            action: 'upload',
+            reason: force ? 'force_upload' : 'upload'
+          };
+          if (!force) {
+            conflictDetection = await detectConflict(
+              filePath,
+              clientHash,
+              clientMtime,
+              baseHash,
+              deviceId
+            );
+          }
           if (conflictDetection.conflict) {
             const { conflictPath, conflict } = await handleConflict(
               filePath,
