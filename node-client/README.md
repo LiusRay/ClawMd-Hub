@@ -17,6 +17,11 @@ SERVER_URL=wss://sync.example.com
 ACCESS_TOKEN=replace-with-the-same-secret
 DEVICE_ID=desktop-main
 SYNC_TO_SERVER=true
+LOCAL_DB_PATH=/Users/you/.clawmd-hub/client-state.db
+LOCAL_SCAN_CONCURRENCY=8
+LOCAL_SCAN_PROGRESS_INTERVAL=1000
+UPLOAD_BATCH_SIZE=10
+UPLOAD_BATCH_MAX_MB=20
 ```
 
 ## Run
@@ -28,13 +33,31 @@ npm start
 ## Behavior
 
 - Scans local files on startup
+- Stores local file metadata and hashes in SQLite
+- Reuses SQLite hashes when file size and mtime are unchanged
 - Fetches server file metadata
 - Detects local changes and triggers sync at millisecond-level latency
 - Uploads files missing or changed on the server
 - Downloads files missing locally
 - Watches local changes with `chokidar`
 - Receives remote update notifications over Socket.IO
-- Stores local hash cache under `~/.clawmd-hub/sync`
+- Stores local state under `~/.clawmd-hub/client-state.db` by default
+
+## Local Index Mode
+
+Build or refresh the local SQLite index without connecting to the server:
+
+```bash
+LOCAL_INDEX_ONLY=true npm start
+```
+
+Useful settings:
+
+```bash
+LOCAL_DB_PATH=/Users/you/.clawmd-hub/client-state.db
+LOCAL_SCAN_CONCURRENCY=8
+LOCAL_SCAN_PROGRESS_INTERVAL=1000
+```
 
 ## Ignore Rules
 

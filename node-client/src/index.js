@@ -7,15 +7,20 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const os = require('os');
 const { smartUpload } = require('./smart-upload');
+const localDb = require('./local-db');
+const {
+  updateLocalDbFromPath,
+  buildLocalIndex
+} = require('./local-index');
 
 const RAY_PATH = process.env.RAY_PATH || path.join(process.env.HOME, 'Documents/Ray');
 const SERVER_URL = process.env.SERVER_URL;
 const DEVICE_ID = process.env.DEVICE_ID || uuidv4();
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const SYNC_TO_SERVER = process.env.SYNC_TO_SERVER !== 'false';
-
-const CACHE_DIR = path.join(process.env.HOME, '.clawmd-hub', 'sync');
-const CACHE_FILE = path.join(CACHE_DIR, 'file-hashes.json');
+const LOCAL_INDEX_ONLY = process.env.LOCAL_INDEX_ONLY === 'true';
+const LOCAL_SCAN_CONCURRENCY = parseInt(process.env.LOCAL_SCAN_CONCURRENCY || '8', 10);
+const LOCAL_SCAN_PROGRESS_INTERVAL = parseInt(process.env.LOCAL_SCAN_PROGRESS_INTERVAL || '1000', 10);
 
 if (!ACCESS_TOKEN) {
   console.error('❌ 错误：未配置 ACCESS_TOKEN');
@@ -23,23 +28,25 @@ if (!ACCESS_TOKEN) {
   process.exit(1);
 }
 
-if (!SERVER_URL) {
+if (!LOCAL_INDEX_ONLY && !SERVER_URL) {
   console.error('❌ 错误：未配置 SERVER_URL');
   console.error('请在 .env 文件中设置 SERVER_URL，例如 ws://localhost:3000 或 wss://sync.example.com');
   process.exit(1);
 }
 
-const HTTP_URL = SERVER_URL.replace('wss://', 'https://').replace('ws://', 'http://');
+const HTTP_URL = SERVER_URL
+  ? SERVER_URL.replace('wss://', 'https://').replace('ws://', 'http://')
+  : null;
 
 console.log(`\n🚀 ClawMd Hub Node 客户端启动\n`);
 console.log(`📁 Ray 路径: ${RAY_PATH}`);
-console.log(`🌐 WebSocket: ${SERVER_URL}`);
-console.log(`🌐 HTTP API: ${HTTP_URL}`);
+console.log(`🌐 WebSocket: ${SERVER_URL || 'LOCAL_INDEX_ONLY'}`);
+console.log(`🌐 HTTP API: ${HTTP_URL || 'LOCAL_INDEX_ONLY'}`);
 console.log(`💻 设备 ID: ${DEVICE_ID}`);
 console.log(`🔐 访问令牌: ${ACCESS_TOKEN.substring(0, 8)}...`);
+console.log(`🗄️  本地 SQLite: ${localDb.getDbPath()}`);
+console.log(`🔢 本地扫描并发: ${LOCAL_SCAN_CONCURRENCY}`);
 console.log(`☁️  服务器备份: ${SYNC_TO_SERVER ? '开启' : '关闭'}\n`);
-
-console.log('⏳ 正在连接服务器...');
 
 function loadSyncIgnore() {
   const ignoreFile = path.join(RAY_PATH, '.syncignore');
@@ -87,6 +94,22 @@ function getLocalIP() {
 const LOCAL_IP = getLocalIP();
 console.log(`🏠 本机内网 IP: ${LOCAL_IP || '未检测到'}\n`);
 
+if (LOCAL_INDEX_ONLY) {
+  console.log('🧪 本地索引模式：只扫描并写入 SQLite，不连接服务器\n');
+  buildLocalIndex(RAY_PATH, ignoreRules, localDb, {
+    concurrency: LOCAL_SCAN_CONCURRENCY,
+    progressInterval: LOCAL_SCAN_PROGRESS_INTERVAL
+  })
+    .then(() => process.exit(0))
+    .catch(error => {
+      console.error('❌ 本地索引失败:', error.message);
+      process.exit(1);
+    });
+  return;
+} else {
+  console.log('⏳ 正在连接服务器...');
+}
+
 const socket = io(SERVER_URL, {
   reconnection: true,
   reconnectionDelay: 1000,
@@ -95,54 +118,6 @@ const socket = io(SERVER_URL, {
 });
 
 const syncingFiles = new Set();
-
-async function scanLocalFiles() {
-  console.log('🔍 开始扫描本地文件...');
-  
-  const files = [];
-  
-  async function walk(dir) {
-    try {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
-        const relativePath = path.relative(RAY_PATH, fullPath);
-        
-        let shouldIgnore = false;
-        for (const rule of ignoreRules) {
-          const pattern = rule
-            .replace(/\./g, '\\.')
-            .replace(/\*\*/g, '§§§')
-            .replace(/\*/g, '[^/]*')
-            .replace(/§§§/g, '.*')
-            .replace(/\?/g, '[^/]');
-          
-          const regex = new RegExp('^' + pattern + '$');
-          
-          if (regex.test(relativePath) || regex.test(entry.name)) {
-            shouldIgnore = true;
-            break;
-          }
-        }
-        
-        if (shouldIgnore) continue;
-        
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-        } else {
-          files.push(relativePath);
-        }
-      }
-    } catch (error) {
-    }
-  }
-  
-  await walk(RAY_PATH);
-  
-  console.log(`📊 扫描完成，共 ${files.length} 个文件`);
-  return files;
-}
 async function uploadFilesHTTP(files) {
   const fetch = (await import('node-fetch')).default;
   
@@ -187,60 +162,9 @@ async function getServerFiles() {
     
   } catch (error) {
     console.error('❌ 获取服务器文件列表失败:', error.message);
-    return [];
-  }
-}
-
-async function loadHashCache() {
-  try {
-    const data = await fs.readFile(CACHE_FILE, 'utf8');
-    return JSON.parse(data);
-  } catch (error) {
-    return {};
-  }
-}
-
-async function saveHashCache(cache) {
-  try {
-    await fs.mkdir(CACHE_DIR, { recursive: true });
-    await fs.writeFile(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
-  } catch (error) {
-    console.error('⚠️  保存哈希缓存失败:', error.message);
-  }
-}
-
-async function getFileHash(filePath) {
-  const crypto = require('crypto');
-  const fullPath = path.join(RAY_PATH, filePath);
-  
-  try {
-    const stats = await fs.stat(fullPath);
-    const mtime = stats.mtimeMs;
-    
-    if (hashCache[filePath]) {
-      const cached = hashCache[filePath];
-      
-      if (cached.mtime === mtime) {
-        return cached.hash;
-      }
-    }
-    
-    const content = await fs.readFile(fullPath);
-    const hash = crypto.createHash('md5').update(content).digest('hex');
-    
-    hashCache[filePath] = {
-      hash,
-      mtime,
-      size: stats.size
-    };
-    
-    return hash;
-  } catch (error) {
     throw error;
   }
 }
-
-let hashCache = {};
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -285,13 +209,18 @@ async function downloadFile(filePath) {
 async function startInitialSync() {
   console.log('\n🔄 开始首次同步...\n');
   
-  console.log('💾 加载本地哈希缓存...');
-  hashCache = await loadHashCache();
-  const cacheCount = Object.keys(hashCache).length;
-  console.log(`   已加载 ${cacheCount} 个文件的哈希缓存\n`);
+  const localIndexInitialized = localDb.getState('local_index_initialized') === 'true';
+  console.log(`💾 本地索引: ${localIndexInitialized ? '已初始化' : '首次建立'}`);
+  console.log(`   已记录 ${localDb.countFiles()} 个文件状态\n`);
   
   console.log('📋 获取服务器文件列表...');
-  const serverFiles = await getServerFiles();
+  let serverFiles;
+  try {
+    serverFiles = await getServerFiles();
+  } catch (error) {
+    console.error('❌ 首次同步中止：无法确认服务器文件列表，避免误判为云端空数据');
+    return;
+  }
 
   const serverFileMap = new Map(serverFiles.map(f => [
     f.p || f.path,
@@ -302,39 +231,43 @@ async function startInitialSync() {
   ]));
   console.log(`📋 服务器已有 ${serverFiles.length} 个文件\n`);
   
-  const localFiles = await scanLocalFiles();
-  const localFileSet = new Set(localFiles);
+  const localIndex = await buildLocalIndex(RAY_PATH, ignoreRules, localDb, {
+    concurrency: LOCAL_SCAN_CONCURRENCY,
+    progressInterval: LOCAL_SCAN_PROGRESS_INTERVAL
+  });
+  const localFiles = localIndex.files;
+  const localFileSet = new Set(localFiles.map(file => file.path));
   
-  console.log('🔍 对比文件哈希...');
+  console.log('🔍 对比本地与服务器文件...');
   const filesToUpload = [];
-  let cached = 0;
-  let calculated = 0;
   
-  for (const filePath of localFiles) {
+  for (const localFile of localFiles) {
     try {
-      const localHash = await getFileHash(filePath);
+      const serverFile = serverFileMap.get(localFile.path);
       
-      if (hashCache[filePath] && hashCache[filePath].hash === localHash) {
-        cached++;
+      if (!serverFile || localFile.hash !== serverFile.hash) {
+        filesToUpload.push(localFile.path);
+        localDb.upsertFile({
+          path: localFile.path,
+          size: localFile.size,
+          mtime: localFile.mtime,
+          hash: localFile.hash,
+          syncStatus: 'pending_upload'
+        });
       } else {
-        calculated++;
-      }
-      
-      if ((cached + calculated) % 100 === 0) {
-        console.log(`   已对比 ${cached + calculated}/${localFiles.length} 个文件 (缓存命中: ${cached}, 重新计算: ${calculated})`);
-      }
-      
-      const serverFile = serverFileMap.get(filePath);
-      
-      if (!serverFile || localHash !== serverFile.hash) {
-        filesToUpload.push(filePath);
+        localDb.upsertFile({
+          path: localFile.path,
+          size: localFile.size,
+          mtime: localFile.mtime,
+          hash: localFile.hash,
+          syncStatus: 'synced'
+        });
       }
     } catch (error) {
     }
   }
   
-  await saveHashCache(hashCache);
-  console.log(`\n💾 已保存哈希缓存 (缓存命中: ${cached}, 重新计算: ${calculated})\n`);
+  console.log(`\n💾 已更新 SQLite 索引 (缓存命中: ${localIndex.cached}, 重新计算: ${localIndex.calculated})\n`);
   
   const filesToDownload = [];
 
@@ -364,6 +297,7 @@ async function startInitialSync() {
         await fs.mkdir(path.dirname(fullPath), { recursive: true });
         
         await fs.writeFile(fullPath, content);
+        await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
         
         downloaded++;
         
@@ -381,7 +315,15 @@ async function startInitialSync() {
  
     if (filesToUpload.length > 0) {
      try {
-       await smartUpload(filesToUpload, RAY_PATH, uploadFilesHTTP);
+       await smartUpload(filesToUpload, RAY_PATH, uploadFilesHTTP, {
+         onFileUploaded: async (filePath) => {
+           try {
+             await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+           } catch (error) {
+             console.error(`⚠️  更新本地索引失败: ${filePath}`, error.message);
+           }
+         }
+       });
      } catch (error) {
        console.error('❌ 智能上传失败:', error.message);
      }
@@ -390,7 +332,8 @@ async function startInitialSync() {
     if (filesToUpload.length === 0 && filesToDownload.length === 0) {
     console.log('✅ 所有文件已同步，无需上传或下载！\n');
   }
-  
+  localDb.setState('local_index_initialized', 'true');
+  localDb.setState('last_initial_sync_at', String(Date.now()));
   startWatching();
 }
 
@@ -449,6 +392,7 @@ socket.on('file:update', async (data) => {
   try {
     if (operation === 'delete') {
       await fs.unlink(fullPath);
+      localDb.markFileDeleted(filePath);
       console.log(`🗑️  已删除: ${filePath}`);
     } else {
       try {
@@ -456,6 +400,7 @@ socket.on('file:update', async (data) => {
         const dir = path.dirname(fullPath);
         await fs.mkdir(dir, { recursive: true });
         await fs.writeFile(fullPath, latestContent);
+        await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
         console.log(`💾 已保存: ${filePath}`);
       } catch (error) {
         console.error(`❌ 下载失败，使用通知中的内容: ${filePath}`);
@@ -466,6 +411,7 @@ socket.on('file:update', async (data) => {
             ? Buffer.from(content, 'base64')
             : Buffer.from(content, 'utf8');
           await fs.writeFile(fullPath, fallbackContent);
+          await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
           console.log(`💾 已保存（降级）: ${filePath}`);
         }
       }
@@ -578,21 +524,31 @@ async function handleFileChange(fullPath, operation) {
       }]);
       
       if (result.succeeded > 0) {
+        localDb.markFileDeleted(relativePath);
         console.log(`✅ 删除已同步: ${relativePath}`);
       }
     } else {
       const contentBuffer = await fs.readFile(fullPath);
       const crypto = require('crypto');
       const stats = await fs.stat(fullPath);
+      const hash = crypto.createHash('md5').update(contentBuffer).digest('hex');
       
       socket.emit('file:changed', {
         filePath: relativePath,
         operation,
         content: contentBuffer.toString('base64'),
         contentEncoding: 'base64',
-        hash: crypto.createHash('md5').update(contentBuffer).digest('hex'),
+        hash,
         mtime: stats.mtimeMs,
         deviceId: DEVICE_ID
+      });
+
+      localDb.upsertFile({
+        path: relativePath,
+        size: stats.size,
+        mtime: stats.mtimeMs,
+        hash,
+        syncStatus: 'synced'
       });
 
       console.log(`📤 已发送: ${relativePath}`);

@@ -72,7 +72,7 @@ async function createBatches(files, RAY_PATH, batchSize, maxBatchSizeMB) {
   }
   return batches;
 }
-async function smartUpload(filesToUpload, RAY_PATH, uploadFn) {
+async function smartUpload(filesToUpload, RAY_PATH, uploadFn, options = {}) {
   console.log('🧠 智能上传分析中...\n');
   let totalSizeMB = 0;
   for (const filePath of filesToUpload) {
@@ -91,12 +91,12 @@ async function smartUpload(filesToUpload, RAY_PATH, uploadFn) {
   console.log(`   ${strategy.description}`);
   console.log('');
   if (strategy.mode === 'single') {
-    return await uploadSingle(filesToUpload, RAY_PATH, uploadFn, strategy.concurrency);
+    return await uploadSingle(filesToUpload, RAY_PATH, uploadFn, strategy.concurrency, options);
   } else {
-    return await uploadBatch(filesToUpload, RAY_PATH, uploadFn, strategy);
+    return await uploadBatch(filesToUpload, RAY_PATH, uploadFn, strategy, options);
   }
 }
-async function uploadSingle(files, RAY_PATH, uploadFn, concurrency) {
+async function uploadSingle(files, RAY_PATH, uploadFn, concurrency, options) {
   console.log(`🚀 开始并发上传 ${files.length} 个文件...\n`);
   let uploaded = 0;
   const results = { succeeded: 0, failed: 0 };
@@ -107,6 +107,9 @@ async function uploadSingle(files, RAY_PATH, uploadFn, concurrency) {
         await uploadFn([await buildUploadFile(RAY_PATH, filePath)]);
         results.succeeded++;
         uploaded++;
+        if (options.onFileUploaded) {
+          await options.onFileUploaded(filePath);
+        }
         console.log(`   ✅ [${uploaded}/${files.length}] ${filePath}`);
       } catch (error) {
         results.failed++;
@@ -118,7 +121,7 @@ async function uploadSingle(files, RAY_PATH, uploadFn, concurrency) {
   console.log(`\n✅ 上传完成！成功: ${results.succeeded}, 失败: ${results.failed}\n`);
   return results;
 }
-async function uploadBatch(files, RAY_PATH, uploadFn, strategy) {
+async function uploadBatch(files, RAY_PATH, uploadFn, strategy, options) {
   console.log(`🚀 开始批次并发上传...\n`);
   const { batchSize, concurrency, maxBatchSizeMB } = strategy;
   let uploaded = 0;
@@ -145,6 +148,11 @@ async function uploadBatch(files, RAY_PATH, uploadFn, strategy) {
           }
         }
         const result = await uploadPreparedBatch(uploadFn, batchFiles);
+        if (options.onFileUploaded && result.succeeded === batchFiles.length) {
+          for (const file of batchFiles) {
+            await options.onFileUploaded(file.filePath);
+          }
+        }
         batchFiles.length = 0;
         uploaded += result.succeeded;
         results.succeeded += result.succeeded;
@@ -152,7 +160,7 @@ async function uploadBatch(files, RAY_PATH, uploadFn, strategy) {
         console.log(`   ✅ 批次${batchNum}: ${result.succeeded}/${batch.length} 成功 (${batchSizeMB.toFixed(1)}MB)`);
       } catch (error) {
         console.error(`   ❌ 批次${batchNum}失败，尝试拆分上传: ${error.message}`);
-        const splitResult = await uploadSplitBatch(batch, RAY_PATH, uploadFn);
+        const splitResult = await uploadSplitBatch(batch, RAY_PATH, uploadFn, options);
         uploaded += splitResult.succeeded;
         results.succeeded += splitResult.succeeded;
         results.failed += splitResult.failed;
@@ -181,13 +189,16 @@ async function uploadPreparedBatch(uploadFn, batchFiles) {
   }
   throw lastError;
 }
-async function uploadSplitBatch(batch, RAY_PATH, uploadFn) {
+async function uploadSplitBatch(batch, RAY_PATH, uploadFn, options) {
   const results = { succeeded: 0, failed: 0 };
   for (const filePath of batch) {
     try {
       const result = await uploadPreparedBatch(uploadFn, [await buildUploadFile(RAY_PATH, filePath)]);
       results.succeeded += result.succeeded;
       results.failed += result.failed;
+      if (options.onFileUploaded && result.succeeded > 0) {
+        await options.onFileUploaded(filePath);
+      }
     } catch (error) {
       results.failed++;
       console.error(`      ❌ 拆分上传失败: ${filePath}: ${error.message}`);

@@ -32,12 +32,13 @@ ClawMd Hub focuses on fast file synchronization, not version rollback. Deleted f
 clawmd-hub/
 ├── server/
 ├── node-client/
-├── docs/
-│   └── readme/
-└── test-conflict.sh
+└── docs/
+    └── readme/
 ```
 
 The server stores file content on disk and metadata in MongoDB. Redis is used for device state, hash cache, trash records, and short-term operation logs.
+
+The Node client stores local file metadata and hashes in SQLite. On later starts, unchanged files reuse the SQLite hash instead of recalculating every file hash.
 
 ## Quick Start
 
@@ -82,6 +83,17 @@ SERVER_URL=wss://sync.example.com
 ACCESS_TOKEN=replace-with-the-same-secret
 DEVICE_ID=desktop-main
 SYNC_TO_SERVER=true
+LOCAL_DB_PATH=/Users/you/.clawmd-hub/client-state.db
+LOCAL_SCAN_CONCURRENCY=8
+LOCAL_SCAN_PROGRESS_INTERVAL=1000
+UPLOAD_BATCH_SIZE=10
+UPLOAD_BATCH_MAX_MB=20
+```
+
+Local index only mode:
+
+```bash
+LOCAL_INDEX_ONLY=true npm start
 ```
 
 ## Plugin Direction

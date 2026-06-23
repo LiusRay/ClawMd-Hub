@@ -17,6 +17,7 @@ ClawMd Hub 专注于快速文件同步，不提供版本回滚能力。本地删
 - 基于 Socket.IO 的实时设备连接
 - HTTP 批量上传和文件下载
 - 基于 hash 对比的首次双向同步
+- 客户端 SQLite 本地索引，避免重复计算未变化文件的 hash
 - 支持 `.syncignore`
 - MongoDB 文件元数据索引
 - Redis 设备状态和短期操作缓存
@@ -32,12 +33,13 @@ ClawMd Hub 专注于快速文件同步，不提供版本回滚能力。本地删
 clawmd-hub/
 ├── server/
 ├── node-client/
-├── docs/
-│   └── readme/
-└── test-conflict.sh
+└── docs/
+    └── readme/
 ```
 
 服务端把文件内容存储在磁盘上，把文件元数据存储在 MongoDB 中。Redis 用于设备状态、hash 缓存、回收站记录和短期操作日志。
+
+Node 客户端会把本地文件元数据和 hash 存到 SQLite。后续启动时，如果文件大小和修改时间没有变化，就直接复用 SQLite 中的 hash，不再重复计算全部文件。
 
 ## 快速开始
 
@@ -82,6 +84,17 @@ SERVER_URL=wss://sync.example.com
 ACCESS_TOKEN=replace-with-the-same-secret
 DEVICE_ID=desktop-main
 SYNC_TO_SERVER=true
+LOCAL_DB_PATH=/Users/you/.clawmd-hub/client-state.db
+LOCAL_SCAN_CONCURRENCY=8
+LOCAL_SCAN_PROGRESS_INTERVAL=1000
+UPLOAD_BATCH_SIZE=10
+UPLOAD_BATCH_MAX_MB=20
+```
+
+只建立本地 SQLite 索引，不连接服务器：
+
+```bash
+LOCAL_INDEX_ONLY=true npm start
 ```
 
 ## 插件方向
