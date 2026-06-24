@@ -77,7 +77,11 @@ function loadSyncIgnore() {
   }
 }
 
-const ignoreRules = loadSyncIgnore();
+let ignoreRules = loadSyncIgnore();
+let watcher = null;
+let fullSyncRunning = false;
+let pendingFullSync = false;
+let syncIgnoreReloadTimer = null;
 
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
@@ -207,112 +211,118 @@ async function downloadFile(filePath) {
 }
 
 async function startInitialSync() {
-  console.log('\n🔄 开始首次同步...\n');
-  
-  const localIndexInitialized = localDb.getState('local_index_initialized') === 'true';
-  console.log(`💾 本地索引: ${localIndexInitialized ? '已初始化' : '首次建立'}`);
-  console.log(`   已记录 ${localDb.countFiles()} 个文件状态\n`);
-  
-  console.log('📋 获取服务器文件列表...');
-  let serverFiles;
-  try {
-    serverFiles = await getServerFiles();
-  } catch (error) {
-    console.error('❌ 首次同步中止：无法确认服务器文件列表，避免误判为云端空数据');
+  if (fullSyncRunning) {
+    pendingFullSync = true;
+    console.log('⏳ 全量同步正在进行，已排队下一次同步');
     return;
   }
 
-  const serverFileMap = new Map(serverFiles.map(f => [
-    f.p || f.path,
-    {
-      hash: f.h || f.hash,
-      size: f.s || f.size
-    }
-  ]));
-  console.log(`📋 服务器已有 ${serverFiles.length} 个文件\n`);
-  
-  const localIndex = await buildLocalIndex(RAY_PATH, ignoreRules, localDb, {
-    concurrency: LOCAL_SCAN_CONCURRENCY,
-    progressInterval: LOCAL_SCAN_PROGRESS_INTERVAL
-  });
-  const localFiles = localIndex.files;
-  const localFileSet = new Set(localFiles.map(file => file.path));
-  
-  console.log('🔍 对比本地与服务器文件...');
-  const filesToUpload = [];
-  
-  for (const localFile of localFiles) {
-    try {
-      const serverFile = serverFileMap.get(localFile.path);
-      
-      if (!serverFile || localFile.hash !== serverFile.hash) {
-        filesToUpload.push(localFile.path);
-        localDb.upsertFile({
-          path: localFile.path,
-          size: localFile.size,
-          mtime: localFile.mtime,
-          hash: localFile.hash,
-          syncStatus: 'pending_upload'
-        });
-      } else {
-        localDb.upsertFile({
-          path: localFile.path,
-          size: localFile.size,
-          mtime: localFile.mtime,
-          hash: localFile.hash,
-          syncStatus: 'synced'
-        });
-      }
-    } catch (error) {
-    }
-  }
-  
-  console.log(`\n💾 已更新 SQLite 索引 (缓存命中: ${localIndex.cached}, 重新计算: ${localIndex.calculated})\n`);
-  
-  const filesToDownload = [];
+  fullSyncRunning = true;
+  console.log('\n🔄 开始首次同步...\n');
 
-  for (const serverFile of serverFiles) {
-    const filePath = serverFile.p || serverFile.path;
-    if (filePath && !localFileSet.has(filePath)) {
-      filesToDownload.push(filePath);
+  try {
+    const localIndexInitialized = localDb.getState('local_index_initialized') === 'true';
+    console.log(`💾 本地索引: ${localIndexInitialized ? '已初始化' : '首次建立'}`);
+    console.log(`   已记录 ${localDb.countFiles()} 个文件状态\n`);
+
+    console.log('📋 获取服务器文件列表...');
+    let serverFiles;
+    try {
+      serverFiles = await getServerFiles();
+    } catch (error) {
+      console.error('❌ 首次同步中止：无法确认服务器文件列表，避免误判为云端空数据');
+      return;
     }
-  }
-  
-  console.log(`📤 需要上传: ${filesToUpload.length} 个文件`);
-  console.log(`📥 需要下载: ${filesToDownload.length} 个文件`);
-  console.log(`✅ 已同步: ${localFiles.length - filesToUpload.length} 个文件\n`);
-  
-  let uploaded = 0;
-  let downloaded = 0;
-  let failedBatches = [];
-  
-  if (filesToDownload.length > 0) {
-    console.log('📥 开始下载文件...\n');
-    
-    for (const filePath of filesToDownload) {
+
+    const serverFileMap = new Map(serverFiles.map(f => [
+      f.p || f.path,
+      {
+        hash: f.h || f.hash,
+        size: f.s || f.size
+      }
+    ]));
+    console.log(`📋 服务器已有 ${serverFiles.length} 个文件\n`);
+
+    const localIndex = await buildLocalIndex(RAY_PATH, ignoreRules, localDb, {
+      concurrency: LOCAL_SCAN_CONCURRENCY,
+      progressInterval: LOCAL_SCAN_PROGRESS_INTERVAL
+    });
+    const localFiles = localIndex.files;
+    const localFileSet = new Set(localFiles.map(file => file.path));
+
+    console.log('🔍 对比本地与服务器文件...');
+    const filesToUpload = [];
+
+    for (const localFile of localFiles) {
       try {
-        const content = await downloadFile(filePath);
-        const fullPath = path.join(RAY_PATH, filePath);
-        
-        await fs.mkdir(path.dirname(fullPath), { recursive: true });
-        
-        await fs.writeFile(fullPath, content);
-        await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
-        
-        downloaded++;
-        
-        if (downloaded % 10 === 0) {
-          console.log(`   已下载 ${downloaded}/${filesToDownload.length} 个文件...`);
+        const serverFile = serverFileMap.get(localFile.path);
+
+        if (!serverFile || localFile.hash !== serverFile.hash) {
+          filesToUpload.push(localFile.path);
+          localDb.upsertFile({
+            path: localFile.path,
+            size: localFile.size,
+            mtime: localFile.mtime,
+            hash: localFile.hash,
+            syncStatus: 'pending_upload'
+          });
+        } else {
+          localDb.upsertFile({
+            path: localFile.path,
+            size: localFile.size,
+            mtime: localFile.mtime,
+            hash: localFile.hash,
+            syncStatus: 'synced'
+          });
         }
-        
       } catch (error) {
-        console.error(`❌ 下载失败: ${filePath}`, error.message);
       }
     }
-    
-    console.log(`\n✅ 下载完成！共下载 ${downloaded}/${filesToDownload.length} 个文件\n`);
+
+    console.log(`\n💾 已更新 SQLite 索引 (缓存命中: ${localIndex.cached}, 重新计算: ${localIndex.calculated})\n`);
+
+    const filesToDownload = [];
+
+    for (const serverFile of serverFiles) {
+      const filePath = serverFile.p || serverFile.path;
+      if (filePath && !localFileSet.has(filePath)) {
+        filesToDownload.push(filePath);
+      }
     }
- 
+
+    console.log(`📤 需要上传: ${filesToUpload.length} 个文件`);
+    console.log(`📥 需要下载: ${filesToDownload.length} 个文件`);
+    console.log(`✅ 已同步: ${localFiles.length - filesToUpload.length} 个文件\n`);
+
+    let downloaded = 0;
+
+    if (filesToDownload.length > 0) {
+      console.log('📥 开始下载文件...\n');
+
+      for (const filePath of filesToDownload) {
+        try {
+          const content = await downloadFile(filePath);
+          const fullPath = path.join(RAY_PATH, filePath);
+
+          await fs.mkdir(path.dirname(fullPath), { recursive: true });
+
+          await fs.writeFile(fullPath, content);
+          await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+
+          downloaded++;
+
+          if (downloaded % 10 === 0) {
+            console.log(`   已下载 ${downloaded}/${filesToDownload.length} 个文件...`);
+          }
+
+        } catch (error) {
+          console.error(`❌ 下载失败: ${filePath}`, error.message);
+        }
+      }
+
+      console.log(`\n✅ 下载完成！共下载 ${downloaded}/${filesToDownload.length} 个文件\n`);
+    }
+
     if (filesToUpload.length > 0) {
      try {
        await smartUpload(filesToUpload, RAY_PATH, uploadFilesHTTP, {
@@ -335,6 +345,14 @@ async function startInitialSync() {
   localDb.setState('local_index_initialized', 'true');
   localDb.setState('last_initial_sync_at', String(Date.now()));
   startWatching();
+  } finally {
+    fullSyncRunning = false;
+    if (pendingFullSync) {
+      pendingFullSync = false;
+      console.log('🔁 执行排队的全量同步');
+      setTimeout(() => startInitialSync(), 1000);
+    }
+  }
 }
 
 socket.on('connect', () => {
@@ -462,6 +480,11 @@ socket.on('connect_error', (error) => {
 });
 
 function startWatching() {
+  if (watcher) {
+    watcher.close();
+    watcher = null;
+  }
+
   console.log('👀 开始监听文件变化...\n');
   
   const ignoredPatterns = ignoreRules.map(rule => {
@@ -476,13 +499,12 @@ function startWatching() {
   
   const explicitIgnore = [
     path.join(RAY_PATH, '**/.git/**'),
-    path.join(RAY_PATH, '**/.claude/**'),
     path.join(RAY_PATH, '**/.DS_Store'),
     path.join(RAY_PATH, '**/node_modules/**'),
     path.join(RAY_PATH, '**/*.log')
   ];
   
-  const watcher = chokidar.watch(RAY_PATH, {
+  watcher = chokidar.watch(RAY_PATH, {
     ignored: [...ignoredPatterns, ...explicitIgnore],
     persistent: true,
     ignoreInitial: true,
@@ -513,6 +535,10 @@ async function handleFileChange(fullPath, operation) {
   }
 
   const relativePath = path.relative(RAY_PATH, fullPath);
+
+  if (relativePath === '.syncignore' && operation !== 'delete') {
+    scheduleSyncIgnoreReload();
+  }
   
   console.log(`📝 本地文件变化: ${relativePath} (${operation})`);
 
@@ -558,8 +584,25 @@ async function handleFileChange(fullPath, operation) {
   }
 }
 
+function scheduleSyncIgnoreReload() {
+  if (syncIgnoreReloadTimer) {
+    clearTimeout(syncIgnoreReloadTimer);
+  }
+
+  syncIgnoreReloadTimer = setTimeout(() => {
+    syncIgnoreReloadTimer = null;
+    console.log('🔁 检测到 .syncignore 更新，重新加载规则并触发全量扫描');
+    ignoreRules = loadSyncIgnore();
+    startWatching();
+    startInitialSync();
+  }, 1500);
+}
+
 process.on('SIGINT', () => {
   console.log('\n👋 正在退出...');
+  if (watcher) {
+    watcher.close();
+  }
   socket.disconnect();
   process.exit(0);
 });
