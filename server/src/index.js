@@ -146,22 +146,26 @@ io.on('connection', (socket) => {
     if (!authenticated) {
       console.log(`⚠️  收到未认证连接的文件上传，尝试从数据中验证...`);
     }
-    const { filePath, operation, content, contentEncoding, deviceId, isInitialSync } = data;
+    const { filePath, operation, content, contentEncoding, deviceId, isInitialSync, hash, size } = data;
     if (!isInitialSync) {
       console.log(`📝 文件变更: ${filePath} (${operation}) from ${deviceId}`);
     }
-    socket.broadcast.emit('file:update', {
-      filePath,
-      operation,
-      content,
-      contentEncoding,
-      fromDevice: deviceId,
-      timestamp: Date.now()
-    });
     try {
       if (operation === 'delete') {
-        await deleteFileFromServer(filePath);
         const db = getDb();
+        const existingFile = await db.collection('files').findOne(
+          { path: filePath },
+          { projection: { deleted: 1 } }
+        );
+
+        if (existingFile && existingFile.deleted) {
+          if (!isInitialSync) {
+            console.log(`⏭️  文件已是删除状态，跳过广播: ${filePath}`);
+          }
+          return;
+        }
+
+        await deleteFileFromServer(filePath);
         await db.collection('files').updateOne(
           { path: filePath },
           { $set: { deleted: true, updated_at: Date.now() } }
@@ -169,19 +173,37 @@ io.on('connection', (socket) => {
         if (!isInitialSync) {
           console.log(`🗑️  已删除服务器文件: ${filePath}`);
         }
+        socket.broadcast.emit('file:update', {
+          filePath,
+          operation,
+          fromDevice: deviceId,
+          timestamp: Date.now()
+        });
       } else {
         const contentBuffer = decodeFileContent(content, contentEncoding);
-        await saveFileToServer(filePath, contentBuffer);
         const crypto = require('crypto');
-        const hash = crypto.createHash('md5').update(contentBuffer).digest('hex');
-        const size = contentBuffer.length;
+        const fileHash = hash || crypto.createHash('md5').update(contentBuffer).digest('hex');
+        const fileSize = size || contentBuffer.length;
         const db = getDb();
+        const existingFile = await db.collection('files').findOne(
+          { path: filePath },
+          { projection: { hash: 1, deleted: 1 } }
+        );
+
+        if (existingFile && !existingFile.deleted && existingFile.hash === fileHash) {
+          if (!isInitialSync) {
+            console.log(`⏭️  内容未变化，跳过广播: ${filePath}`);
+          }
+          return;
+        }
+
+        await saveFileToServer(filePath, contentBuffer);
         await db.collection('files').updateOne(
           { path: filePath },
           {
             $set: {
-              hash,
-              size,
+              hash: fileHash,
+              size: fileSize,
               mtime: Date.now(),
               deleted: false,
               updated_at: Date.now()
@@ -193,6 +215,16 @@ io.on('connection', (socket) => {
         if (!isInitialSync) {
           console.log(`💾 已保存到服务器: ${filePath}`);
         }
+        socket.broadcast.emit('file:update', {
+          filePath,
+          operation,
+          content,
+          contentEncoding,
+          hash: fileHash,
+          size: fileSize,
+          fromDevice: deviceId,
+          timestamp: Date.now()
+        });
       }
     } catch (error) {
       console.error(`❌ 保存文件失败: ${filePath}`, error.message);
@@ -237,15 +269,54 @@ app.post('/upload', async (req, res) => {
     for (const file of files) {
       const { filePath, content, contentEncoding, operation, hash: clientHash, baseHash, mtime: clientMtime, force } = file;
       try {
+        let shouldBroadcast = false;
+        let broadcastHash = null;
+        let broadcastSize = null;
+        let broadcastOperation = operation || 'update';
+
         if (operation === 'delete') {
-          await deleteFileFromServer(filePath);
-          await db.collection('files').updateOne(
+          const existingFile = await db.collection('files').findOne(
             { path: filePath },
-            { $set: { deleted: true, updated_at: Date.now() } }
+            { projection: { deleted: 1 } }
           );
-          await redisClient.del(`file:hash:${filePath}`);
-          results.push({ filePath, success: true, action: 'deleted' });
+
+          if (existingFile && existingFile.deleted) {
+            results.push({
+              filePath,
+              success: true,
+              action: 'unchanged',
+              reason: 'already_deleted'
+            });
+          } else {
+            await deleteFileFromServer(filePath);
+            await db.collection('files').updateOne(
+              { path: filePath },
+              { $set: { deleted: true, updated_at: Date.now() } }
+            );
+            await redisClient.del(`file:hash:${filePath}`);
+            results.push({ filePath, success: true, action: 'deleted' });
+            shouldBroadcast = true;
+          }
         } else {
+          const contentBuffer = decodeFileContent(content, contentEncoding);
+          const hash = clientHash || crypto.createHash('md5').update(contentBuffer).digest('hex');
+          const size = contentBuffer.length;
+          broadcastHash = hash;
+          broadcastSize = size;
+
+          const existingFile = await db.collection('files').findOne(
+            { path: filePath },
+            { projection: { hash: 1, deleted: 1 } }
+          );
+
+          if (existingFile && !existingFile.deleted && existingFile.hash === hash) {
+            results.push({
+              filePath,
+              success: true,
+              action: 'unchanged',
+              reason: 'same_hash'
+            });
+          } else {
           let conflictDetection = {
             conflict: false,
             action: 'upload',
@@ -289,10 +360,7 @@ app.post('/upload', async (req, res) => {
               timestamp: Date.now()
             });
           } else {
-            const contentBuffer = decodeFileContent(content, contentEncoding);
             await saveFileToServer(filePath, contentBuffer);
-            const hash = clientHash || crypto.createHash('md5').update(contentBuffer).digest('hex');
-            const size = contentBuffer.length;
             await redisClient.set(
               `file:hash:${filePath}`,
               JSON.stringify({ hash, size, mtime: Date.now() }),
@@ -339,14 +407,20 @@ app.post('/upload', async (req, res) => {
               action: conflictDetection.action,
               reason: conflictDetection.reason
             });
+            shouldBroadcast = true;
+          }
           }
         }
-        io.emit('file:update', {
-          filePath,
-          operation: operation || 'update',
-          fromDevice: deviceId,
-          timestamp: Date.now()
-        });
+        if (shouldBroadcast) {
+          io.emit('file:update', {
+            filePath,
+            operation: broadcastOperation,
+            hash: broadcastHash,
+            size: broadcastSize,
+            fromDevice: deviceId,
+            timestamp: Date.now()
+          });
+        }
       } catch (error) {
         console.error(`❌ 保存失败: ${filePath}`, error.message);
         results.push({ filePath, success: false, error: error.message });

@@ -19,12 +19,27 @@ function compileIgnoreRules(rules) {
 }
 
 function shouldIgnore(relativePath, entryName, compiledRules) {
-  return compiledRules.some(regex => regex.test(relativePath) || regex.test(entryName));
+  return compiledRules.some(regex =>
+    regex.test(relativePath) ||
+    regex.test(`${relativePath}/`) ||
+    regex.test(entryName) ||
+    regex.test(`${entryName}/`)
+  );
+}
+
+function createIgnoreMatcher(rules) {
+  const compiledRules = compileIgnoreRules(rules);
+
+  return (relativePath) => {
+    const normalizedPath = relativePath.split(path.sep).join('/');
+    const entryName = path.basename(normalizedPath);
+    return shouldIgnore(normalizedPath, entryName, compiledRules);
+  };
 }
 
 async function scanLocalFiles(rayPath, ignoreRules, options = {}) {
   const progressInterval = options.progressInterval || DEFAULT_PROGRESS_INTERVAL;
-  const compiledRules = compileIgnoreRules(ignoreRules);
+  const isIgnored = createIgnoreMatcher(ignoreRules);
   const files = [];
   let scanned = 0;
 
@@ -38,7 +53,7 @@ async function scanLocalFiles(rayPath, ignoreRules, options = {}) {
         const fullPath = path.join(dir, entry.name);
         const relativePath = path.relative(rayPath, fullPath);
 
-        if (shouldIgnore(relativePath, entry.name, compiledRules)) {
+        if (isIgnored(relativePath)) {
           continue;
         }
 
@@ -179,5 +194,6 @@ module.exports = {
   calculateFileHash,
   getFileState,
   updateLocalDbFromPath,
-  buildLocalIndex
+  buildLocalIndex,
+  createIgnoreMatcher
 };

@@ -10,7 +10,8 @@ const { smartUpload } = require('./smart-upload');
 const localDb = require('./local-db');
 const {
   updateLocalDbFromPath,
-  buildLocalIndex
+  buildLocalIndex,
+  createIgnoreMatcher
 } = require('./local-index');
 
 const RAY_PATH = process.env.RAY_PATH || path.join(process.env.HOME, 'Documents/Ray');
@@ -21,6 +22,8 @@ const SYNC_TO_SERVER = process.env.SYNC_TO_SERVER !== 'false';
 const LOCAL_INDEX_ONLY = process.env.LOCAL_INDEX_ONLY === 'true';
 const LOCAL_SCAN_CONCURRENCY = parseInt(process.env.LOCAL_SCAN_CONCURRENCY || '8', 10);
 const LOCAL_SCAN_PROGRESS_INTERVAL = parseInt(process.env.LOCAL_SCAN_PROGRESS_INTERVAL || '1000', 10);
+const FILE_CHANGE_DEBOUNCE_MS = parseInt(process.env.FILE_CHANGE_DEBOUNCE_MS || '1000', 10);
+const REMOTE_WRITE_SUPPRESS_MS = parseInt(process.env.REMOTE_WRITE_SUPPRESS_MS || '5000', 10);
 
 if (!ACCESS_TOKEN) {
   console.error('❌ 错误：未配置 ACCESS_TOKEN');
@@ -46,6 +49,7 @@ console.log(`💻 设备 ID: ${DEVICE_ID}`);
 console.log(`🔐 访问令牌: ${ACCESS_TOKEN.substring(0, 8)}...`);
 console.log(`🗄️  本地 SQLite: ${localDb.getDbPath()}`);
 console.log(`🔢 本地扫描并发: ${LOCAL_SCAN_CONCURRENCY}`);
+console.log(`⏱️  文件变化防抖: ${FILE_CHANGE_DEBOUNCE_MS}ms`);
 console.log(`☁️  服务器备份: ${SYNC_TO_SERVER ? '开启' : '关闭'}\n`);
 
 function loadSyncIgnore() {
@@ -82,6 +86,8 @@ let watcher = null;
 let fullSyncRunning = false;
 let pendingFullSync = false;
 let syncIgnoreReloadTimer = null;
+const pendingFileChanges = new Map();
+let isIgnoredPath = createIgnoreMatcher(ignoreRules);
 
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
@@ -285,7 +291,7 @@ async function startInitialSync() {
 
     for (const serverFile of serverFiles) {
       const filePath = serverFile.p || serverFile.path;
-      if (filePath && !localFileSet.has(filePath)) {
+      if (filePath && !isIgnoredPath(filePath) && !localFileSet.has(filePath)) {
         filesToDownload.push(filePath);
       }
     }
@@ -395,13 +401,17 @@ socket.on('registered', (data) => {
 });
 
 socket.on('file:update', async (data) => {
-  const { filePath, operation, content, fromDevice } = data;
+  const { filePath, operation, content, fromDevice, hash, size } = data;
   
   if (fromDevice === DEVICE_ID) {
     return;
   }
 
   const fullPath = path.join(RAY_PATH, filePath);
+
+  if (isIgnoredPath(filePath)) {
+    return;
+  }
   
   console.log(`📥 收到远程更新: ${filePath} (${operation}) from ${fromDevice}`);
   
@@ -409,10 +419,29 @@ socket.on('file:update', async (data) => {
   
   try {
     if (operation === 'delete') {
-      await fs.unlink(fullPath);
+      try {
+        await fs.unlink(fullPath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error;
+        }
+      }
       localDb.markFileDeleted(filePath);
       console.log(`🗑️  已删除: ${filePath}`);
     } else {
+      const cached = localDb.getFile(filePath);
+      if (hash && cached && cached.hash === hash) {
+        console.log(`⏭️  远程更新已是最新，跳过下载: ${filePath}`);
+        localDb.upsertFile({
+          path: filePath,
+          size: size || cached.size,
+          mtime: cached.mtime,
+          hash,
+          syncStatus: 'synced'
+        });
+        return;
+      }
+
       try {
         const latestContent = await downloadFile(filePath);
         const dir = path.dirname(fullPath);
@@ -437,7 +466,7 @@ socket.on('file:update', async (data) => {
   } catch (error) {
     console.error(`❌ 处理文件失败: ${filePath}`, error.message);
   } finally {
-    setTimeout(() => syncingFiles.delete(fullPath), 1000);
+    setTimeout(() => syncingFiles.delete(fullPath), REMOTE_WRITE_SUPPRESS_MS);
   }
 });
 
@@ -517,16 +546,38 @@ function startWatching() {
   console.log(`📁 监听目录: ${RAY_PATH}`);
   console.log(`🚫 排除规则: ${ignoreRules.length} 条\n`);
   
-  watcher
-  watcher.on('add', (filePath) => handleFileChange(filePath, 'create'));
+  watcher.on('add', (filePath) => queueFileChange(filePath, 'create'));
   
-  watcher.on('change', (filePath) => handleFileChange(filePath, 'update'));
+  watcher.on('change', (filePath) => queueFileChange(filePath, 'update'));
   
-  watcher.on('unlink', (filePath) => handleFileChange(filePath, 'delete'));
+  watcher.on('unlink', (filePath) => queueFileChange(filePath, 'delete'));
 
   watcher.on('error', (error) => {
     console.error('❌ 文件监听错误:', error);
   });
+}
+
+function queueFileChange(fullPath, operation) {
+  if (syncingFiles.has(fullPath)) {
+    return;
+  }
+
+  const relativePath = path.relative(RAY_PATH, fullPath);
+  if (isIgnoredPath(relativePath)) {
+    return;
+  }
+
+  const pending = pendingFileChanges.get(fullPath);
+  if (pending) {
+    clearTimeout(pending.timer);
+  }
+
+  const timer = setTimeout(() => {
+    pendingFileChanges.delete(fullPath);
+    handleFileChange(fullPath, operation);
+  }, FILE_CHANGE_DEBOUNCE_MS);
+
+  pendingFileChanges.set(fullPath, { operation, timer });
 }
 
 async function handleFileChange(fullPath, operation) {
@@ -558,6 +609,19 @@ async function handleFileChange(fullPath, operation) {
       const crypto = require('crypto');
       const stats = await fs.stat(fullPath);
       const hash = crypto.createHash('md5').update(contentBuffer).digest('hex');
+      const cached = localDb.getFile(relativePath);
+
+      if (operation === 'update' && cached && cached.hash === hash) {
+        localDb.upsertFile({
+          path: relativePath,
+          size: stats.size,
+          mtime: stats.mtimeMs,
+          hash,
+          syncStatus: 'synced'
+        });
+        console.log(`⏭️  内容未变化，跳过上传: ${relativePath}`);
+        return;
+      }
       
       socket.emit('file:changed', {
         filePath: relativePath,
@@ -565,6 +629,7 @@ async function handleFileChange(fullPath, operation) {
         content: contentBuffer.toString('base64'),
         contentEncoding: 'base64',
         hash,
+        size: stats.size,
         mtime: stats.mtimeMs,
         deviceId: DEVICE_ID
       });
@@ -593,6 +658,7 @@ function scheduleSyncIgnoreReload() {
     syncIgnoreReloadTimer = null;
     console.log('🔁 检测到 .syncignore 更新，重新加载规则并触发全量扫描');
     ignoreRules = loadSyncIgnore();
+    isIgnoredPath = createIgnoreMatcher(ignoreRules);
     startWatching();
     startInitialSync();
   }, 1500);
