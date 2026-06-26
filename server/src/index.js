@@ -27,6 +27,30 @@ if (!ACCESS_TOKEN) {
   process.exit(1);
 }
 let redisClient;
+async function nextRevision() {
+  const db = getDb();
+  const result = await db.collection('counters').findOneAndUpdate(
+    { _id: 'global_revision' },
+    { $inc: { value: 1 } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  const document = result.value || result;
+  return document.value;
+}
+
+function buildFileManifest(file) {
+  return {
+    p: file.path,
+    h: file.hash || null,
+    s: file.size || 0,
+    deleted: Boolean(file.deleted),
+    r: file.revision || 0,
+    updatedAt: file.updated_at || null,
+    deletedAt: file.deleted_at || null,
+    modifiedBy: file.last_modified_by || null
+  };
+}
+
 async function initRedis() {
   redisClient = redis.createClient({
     socket: {
@@ -146,7 +170,7 @@ io.on('connection', (socket) => {
     if (!authenticated) {
       console.log(`⚠️  收到未认证连接的文件上传，尝试从数据中验证...`);
     }
-    const { filePath, operation, content, contentEncoding, deviceId, isInitialSync, hash, size } = data;
+    const { filePath, operation, content, contentEncoding, deviceId, isInitialSync, hash, size, baseRevision } = data;
     if (!isInitialSync) {
       console.log(`📝 文件变更: ${filePath} (${operation}) from ${deviceId}`);
     }
@@ -165,10 +189,22 @@ io.on('connection', (socket) => {
           return;
         }
 
+        const revision = await nextRevision();
         await deleteFileFromServer(filePath);
         await db.collection('files').updateOne(
           { path: filePath },
-          { $set: { deleted: true, updated_at: Date.now() } }
+          {
+            $set: {
+              deleted: true,
+              revision,
+              deleted_at: Date.now(),
+              updated_at: Date.now(),
+              last_modified_by: deviceId,
+              last_modified_at: Date.now()
+            },
+            $setOnInsert: { created_at: Date.now(), conflict_count: 0 }
+          },
+          { upsert: true }
         );
         if (!isInitialSync) {
           console.log(`🗑️  已删除服务器文件: ${filePath}`);
@@ -177,6 +213,7 @@ io.on('connection', (socket) => {
           filePath,
           operation,
           fromDevice: deviceId,
+          revision,
           timestamp: Date.now()
         });
       } else {
@@ -187,7 +224,7 @@ io.on('connection', (socket) => {
         const db = getDb();
         const existingFile = await db.collection('files').findOne(
           { path: filePath },
-          { projection: { hash: 1, deleted: 1 } }
+          { projection: { hash: 1, deleted: 1, revision: 1 } }
         );
 
         if (existingFile && !existingFile.deleted && existingFile.hash === fileHash) {
@@ -197,7 +234,32 @@ io.on('connection', (socket) => {
           return;
         }
 
+        if (
+          existingFile &&
+          !existingFile.deleted &&
+          baseRevision &&
+          existingFile.revision &&
+          baseRevision !== existingFile.revision
+        ) {
+          const { conflictPath } = await handleConflict(
+            filePath,
+            contentBuffer,
+            deviceId,
+            saveFileToServer
+          );
+          socket.emit('conflict:detected', {
+            originalPath: filePath,
+            conflictPath,
+            deviceId,
+            serverHash: existingFile.hash,
+            clientHash: fileHash,
+            timestamp: Date.now()
+          });
+          return;
+        }
+
         await saveFileToServer(filePath, contentBuffer);
+        const revision = await nextRevision();
         await db.collection('files').updateOne(
           { path: filePath },
           {
@@ -206,9 +268,13 @@ io.on('connection', (socket) => {
               size: fileSize,
               mtime: Date.now(),
               deleted: false,
+              revision,
+              deleted_at: null,
+              last_modified_by: deviceId,
+              last_modified_at: Date.now(),
               updated_at: Date.now()
             },
-            $setOnInsert: { created_at: Date.now() }
+            $setOnInsert: { created_at: Date.now(), conflict_count: 0 }
           },
           { upsert: true }
         );
@@ -223,6 +289,7 @@ io.on('connection', (socket) => {
           hash: fileHash,
           size: fileSize,
           fromDevice: deviceId,
+          revision,
           timestamp: Date.now()
         });
       }
@@ -267,7 +334,7 @@ app.post('/upload', async (req, res) => {
     const db = getDb();
     const results = [];
     for (const file of files) {
-      const { filePath, content, contentEncoding, operation, hash: clientHash, baseHash, mtime: clientMtime, force } = file;
+      const { filePath, content, contentEncoding, operation, hash: clientHash, baseHash, baseRevision, mtime: clientMtime, force } = file;
       try {
         let shouldBroadcast = false;
         let broadcastHash = null;
@@ -277,7 +344,7 @@ app.post('/upload', async (req, res) => {
         if (operation === 'delete') {
           const existingFile = await db.collection('files').findOne(
             { path: filePath },
-            { projection: { deleted: 1 } }
+            { projection: { deleted: 1, revision: 1, hash: 1 } }
           );
 
           if (existingFile && existingFile.deleted) {
@@ -285,16 +352,49 @@ app.post('/upload', async (req, res) => {
               filePath,
               success: true,
               action: 'unchanged',
-              reason: 'already_deleted'
+              reason: 'already_deleted',
+              revision: existingFile.revision || 0
+            });
+          } else if (
+            existingFile &&
+            !existingFile.deleted &&
+            baseRevision &&
+            existingFile.revision &&
+            baseRevision !== existingFile.revision
+          ) {
+            results.push({
+              filePath,
+              success: true,
+              conflict: true,
+              action: 'skip_delete',
+              reason: 'base_revision_mismatch_delete',
+              serverHash: existingFile.hash,
+              serverRevision: existingFile.revision,
+              message: '服务器版本已变化，跳过删除'
             });
           } else {
+            const revision = await nextRevision();
             await deleteFileFromServer(filePath);
             await db.collection('files').updateOne(
               { path: filePath },
-              { $set: { deleted: true, updated_at: Date.now() } }
+              {
+                $set: {
+                  deleted: true,
+                  revision,
+                  deleted_at: Date.now(),
+                  updated_at: Date.now(),
+                  last_modified_by: deviceId,
+                  last_modified_at: Date.now()
+                },
+                $setOnInsert: {
+                  created_at: Date.now(),
+                  conflict_count: 0
+                }
+              },
+              { upsert: true }
             );
             await redisClient.del(`file:hash:${filePath}`);
-            results.push({ filePath, success: true, action: 'deleted' });
+            results.push({ filePath, success: true, action: 'deleted', revision });
             shouldBroadcast = true;
           }
         } else {
@@ -306,7 +406,7 @@ app.post('/upload', async (req, res) => {
 
           const existingFile = await db.collection('files').findOne(
             { path: filePath },
-            { projection: { hash: 1, deleted: 1 } }
+            { projection: { hash: 1, deleted: 1, revision: 1 } }
           );
 
           if (existingFile && !existingFile.deleted && existingFile.hash === hash) {
@@ -314,7 +414,8 @@ app.post('/upload', async (req, res) => {
               filePath,
               success: true,
               action: 'unchanged',
-              reason: 'same_hash'
+              reason: 'same_hash',
+              revision: existingFile.revision || 0
             });
           } else {
           let conflictDetection = {
@@ -322,15 +423,34 @@ app.post('/upload', async (req, res) => {
             action: 'upload',
             reason: force ? 'force_upload' : 'upload'
           };
-          if (!force) {
-            conflictDetection = await detectConflict(
-              filePath,
-              clientHash,
-              clientMtime,
-              baseHash,
-              deviceId
-            );
-          }
+	          if (!force) {
+	            if (
+	              existingFile &&
+	              !existingFile.deleted &&
+	              baseRevision &&
+	              existingFile.revision &&
+	              baseRevision !== existingFile.revision
+	            ) {
+	              conflictDetection = {
+	                conflict: true,
+	                action: 'create_conflict_copy',
+	                serverFile: existingFile,
+	                reason: 'base_revision_mismatch',
+	                details: {
+	                  serverRevision: existingFile.revision,
+	                  baseRevision
+	                }
+	              };
+	            } else {
+	            conflictDetection = await detectConflict(
+	              filePath,
+	              clientHash,
+	              clientMtime,
+	              baseHash,
+	              deviceId
+	            );
+	            }
+	          }
           if (conflictDetection.conflict) {
             const { conflictPath, conflict } = await handleConflict(
               filePath,
@@ -360,6 +480,7 @@ app.post('/upload', async (req, res) => {
               timestamp: Date.now()
             });
           } else {
+            const revision = await nextRevision();
             await saveFileToServer(filePath, contentBuffer);
             await redisClient.set(
               `file:hash:${filePath}`,
@@ -371,44 +492,49 @@ app.post('/upload', async (req, res) => {
               {
                 $set: {
                   hash,
-                  size,
-                  mtime: Date.now(),
-                  deleted: false,
-                  last_modified_by: deviceId,
-                  last_modified_at: Date.now(),
+	                  size,
+	                  mtime: Date.now(),
+	                  deleted: false,
+	                  revision,
+	                  deleted_at: null,
+	                  last_modified_by: deviceId,
+	                  last_modified_at: Date.now(),
                   updated_at: Date.now()
                 },
                 $setOnInsert: {
                   created_at: Date.now(),
                   conflict_count: 0
                 }
-              },
-              { upsert: true }
-            );
+	              },
+	              { upsert: true }
+	            );
             await db.collection('sync_logs').insertOne({
-              file_path: filePath,
-              action: operation || 'update',
-              device_id: deviceId,
-              hash,
-              timestamp: Date.now()
-            });
+	              file_path: filePath,
+	              action: operation || 'update',
+	              device_id: deviceId,
+	              hash,
+	              revision,
+	              timestamp: Date.now()
+	            });
             const opsKey = `file:ops:${filePath}`;
             const op = JSON.stringify({
               action: operation || 'update',
               device: deviceId,
-              time: Date.now(),
-              hash
-            });
+	              time: Date.now(),
+	              hash,
+	              revision
+	            });
             await redisClient.rPush(opsKey, op);
             await redisClient.expire(opsKey, 86400 * 90);
             results.push({
               filePath,
-              success: true,
-              action: conflictDetection.action,
-              reason: conflictDetection.reason
-            });
-            shouldBroadcast = true;
-          }
+	              success: true,
+	              action: conflictDetection.action,
+	              reason: conflictDetection.reason,
+	              revision
+	            });
+	            shouldBroadcast = true;
+	          }
           }
         }
         if (shouldBroadcast) {
@@ -418,6 +544,7 @@ app.post('/upload', async (req, res) => {
             hash: broadcastHash,
             size: broadcastSize,
             fromDevice: deviceId,
+            revision: results[results.length - 1] && results[results.length - 1].revision,
             timestamp: Date.now()
           });
         }
@@ -545,6 +672,40 @@ app.get('/files', async (req, res) => {
     res.json({ files: simplified });
   } catch (error) {
     console.error('❌ 获取文件列表错误:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+app.get('/manifest', async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (token !== ACCESS_TOKEN) {
+      return res.status(401).json({ error: '访问令牌错误' });
+    }
+    console.log('📋 客户端请求 manifest');
+    const db = getDb();
+    const files = await db.collection('files')
+      .find({})
+      .project({
+        path: 1,
+        hash: 1,
+        size: 1,
+        deleted: 1,
+        revision: 1,
+        updated_at: 1,
+        deleted_at: 1,
+        last_modified_by: 1,
+        _id: 0
+      })
+      .toArray();
+    const manifest = files.map(buildFileManifest);
+    const latest = await db.collection('counters').findOne({ _id: 'global_revision' });
+    console.log(`📋 返回 manifest: ${manifest.length} 条记录`);
+    res.json({
+      files: manifest,
+      latestRevision: latest ? latest.value : 0
+    });
+  } catch (error) {
+    console.error('❌ 获取 manifest 错误:', error);
     res.status(500).json({ error: error.message });
   }
 });

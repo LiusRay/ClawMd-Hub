@@ -1,32 +1,33 @@
 # ClawMd Hub
 
-[English](README.md) · [简体中文](docs/readme/README.zh-CN.md)
+[English](docs/readme/README.en.md) · [简体中文](README.md)
 
-ClawMd Hub is a Markdown knowledge-base sync hub for AI workflows. It watches local files and triggers sync automatically at millisecond-level latency across Node runtimes, cloud servers, and future iOS/Android clients, helping Claude, Codex, and OpenClaw use the same up-to-date AI context layer. Deleted files are synced as soft-delete state on the server. ClawMd Hub does not provide version rollback, so it is best used together with Git for durable history and rollback.
+ClawMd Hub 是一个面向 AI 工作流的 Markdown 资料库同步中枢。它会监听本地文件变化，并以毫秒级延迟自动触发同步到 Node 运行环境、云端服务器以及未来的 iOS/Android 客户端，帮助 Claude、Codex、OpenClaw 使用同一份最新的 AI 上下文资料层。文件删除会同步为服务端软删除状态。ClawMd Hub 不提供版本回滚能力，因此更适合配合 Git 使用，由 Git 负责持久化历史版本和回滚。
 
-## Status
+## 项目状态
 
-This project is under active development. The current version includes a Node.js server and a cross-platform Node runtime client for macOS, Linux, and Windows. It is not a packaged desktop app yet. Installers and service wrappers may be added later. The API, data model, and plugin interfaces may still change before v1.0.
+项目正在开发中。当前版本包含 Node.js 服务端和跨平台 Node 运行端客户端，可运行在 macOS、Linux 和 Windows。它目前还不是桌面安装包，后续可能增加安装包和系统服务封装。v1.0 之前，API、数据模型和插件接口都可能继续调整。
 
-ClawMd Hub focuses on fast file synchronization, not version rollback. Deleted files are synced as delete operations, while the server marks them as soft-deleted and keeps server-side trash records. For Markdown knowledge bases and project documents, use it together with Git when you need durable history, branching, review, or rollback.
+ClawMd Hub 专注于快速文件同步，不提供版本回滚能力。本地删除会作为删除操作同步到服务端，但服务端会标记为软删除，并保留服务端回收站记录。对于 Markdown 资料库和项目文档，建议配合 Git 使用，由 Git 负责历史版本、分支、审查和回滚。
 
-## Features
+## 功能特性
 
-- Markdown and file-based knowledge-base sync
-- Millisecond-level change detection and automatic sync trigger
-- Real-time device connection with Socket.IO
-- HTTP batch upload and file download
-- Initial two-way sync with hash comparison
-- `.syncignore` support
-- MongoDB file metadata index
-- Redis device state and short-term operation cache
-- Delete sync with server-side soft-delete state and trash storage
-- Conflict detection with conflict-copy generation
-- Conflict listing and manual resolution API
-- Cross-platform Node file watcher client
-- Designed to pair with Git for version history and rollback
+- 面向 Markdown 和文件型知识库的同步
+- 毫秒级检测本地变化并自动触发同步
+- 基于 Socket.IO 的实时设备连接
+- HTTP 批量上传和文件下载
+- 基于 hash 对比的首次双向同步
+- 客户端 SQLite 本地索引，避免重复计算未变化文件的 hash
+- 支持 `.syncignore`
+- MongoDB 文件元数据索引
+- Redis 设备状态和短期操作缓存
+- 删除同步、服务端软删除状态和回收站
+- 冲突检测和冲突副本生成
+- 冲突列表和手动解决 API
+- 跨平台 Node 文件监听客户端
+- 建议配合 Git 管理历史版本和回滚
 
-## Architecture
+## 架构
 
 ```text
 clawmd-hub/
@@ -36,13 +37,13 @@ clawmd-hub/
     └── readme/
 ```
 
-The server stores file content on disk and metadata in MongoDB. Redis is used for device state, hash cache, trash records, and short-term operation logs.
+服务端把文件内容存储在磁盘上，把文件元数据存储在 MongoDB 中。Redis 用于设备状态、hash 缓存、回收站记录和短期操作日志。
 
-The Node client stores local file metadata and hashes in SQLite. On later starts, unchanged files reuse the SQLite hash instead of recalculating every file hash.
+Node 客户端会把本地文件元数据和 hash 存到 SQLite。后续启动时，如果文件大小和修改时间没有变化，就直接复用 SQLite 中的 hash，不再重复计算全部文件。
 
-## Quick Start
+## 快速开始
 
-### Server
+### 服务端
 
 ```bash
 cd server
@@ -51,7 +52,7 @@ cp .env.example .env
 npm start
 ```
 
-### Node Client
+### Node 客户端
 
 ```bash
 cd node-client
@@ -60,9 +61,9 @@ cp .env.example .env
 npm start
 ```
 
-## Example Configuration
+## 配置示例
 
-Server:
+服务端：
 
 ```bash
 ACCESS_TOKEN=replace-with-a-long-random-secret
@@ -75,7 +76,7 @@ HOST=0.0.0.0
 NODE_ENV=production
 ```
 
-Node client:
+Node 客户端：
 
 ```bash
 RAY_PATH=/Users/you/Documents/MarkdownVault
@@ -92,80 +93,80 @@ UPLOAD_BATCH_SIZE=10
 UPLOAD_BATCH_MAX_MB=20
 ```
 
-Local index only mode:
+只建立本地 SQLite 索引，不连接服务器：
 
 ```bash
 LOCAL_INDEX_ONLY=true npm start
 ```
 
-## Plugin Direction
+## 插件方向
 
-ClawMd Hub is designed to grow into a plugin-based Markdown knowledge hub:
+ClawMd Hub 后续会发展成插件化的 Markdown AI 资料库中枢：
 
-- Obsidian plugin for vault sync status, conflict review, and manual sync
-- Codex plugin or local tool for project context synchronization
-- Claude/OpenClaw connector or MCP server for reading and writing AI context
-- Web console for devices, files, conflicts, and sync health
+- Obsidian 插件：同步状态、冲突查看、手动同步
+- Codex 插件或本地工具：同步项目上下文
+- Claude/OpenClaw 连接器或 MCP Server：读写 AI 上下文
+- Web 控制台：管理设备、文件、冲突和同步健康状态
 
-## Roadmap
+## 路线图
 
-The roadmap describes planned development directions, not features that are already fully available in the current release. Items may change as the project evolves.
+路线图描述的是后续发展方向，不代表当前版本已经完整具备这些能力。具体功能和优先级会随着项目推进继续调整。
 
-### v0.3 Stability
+### v0.3 稳定性
 
-- Improve download and retry behavior
-- Stream downloads from the server
-- Add local status/check commands
-- Add conflict query helpers
-- Add log rotation and operational docs
+- 优化下载和重试逻辑
+- 服务端改为流式下载
+- 增加本地状态检查命令
+- 增加冲突查询辅助工具
+- 增加日志轮转和运维文档
 
-### v0.4 Node Runtime Packaging
+### v0.4 Node 运行环境打包
 
-- Provide install and service scripts for macOS, Linux, and Windows
-- Add one-command update flow
-- Add desktop notifications
-- Add local consistency check tooling
+- 提供 macOS、Linux、Windows 的安装和服务脚本
+- 增加一键更新流程
+- 增加桌面通知
+- 增加本地一致性检查工具
 
-### v0.5 Plugin SDK
+### v0.5 插件 SDK
 
 - JavaScript/TypeScript SDK
-- REST API documentation
-- MCP adapter prototype
-- Obsidian plugin prototype
+- REST API 文档
+- MCP 适配器原型
+- Obsidian 插件原型
 
-### v0.6 Mobile Clients
+### v0.6 移动客户端
 
-- iOS app-scoped sync
-- Android directory sync
-- Manual and background sync modes
-- Conflict viewing and selective sync
+- iOS App 内同步
+- Android 目录同步
+- 手动和后台同步模式
+- 冲突查看和选择性同步
 
-### v1.0 AI Knowledge Sync Layer
+### v1.0 AI 知识库同步层
 
-- Stable desktop/iOS/Android protocol
-- Clear file states: active, deleted, conflict, resolved
-- Device-level sync status
-- Durable sync logs
-- Reliable conflict-preserving behavior
+- 稳定的桌面端/iOS/Android 协议
+- 清晰的文件状态：active、deleted、conflict、resolved
+- 设备级同步状态
+- 持久化同步日志
+- 可靠的冲突副本保留机制
 
-## Security Notes
+## 安全说明
 
-- Never commit `.env` files.
-- Use a long random `ACCESS_TOKEN`.
-- Deploy production servers behind HTTPS/WSS.
-- Back up `STORAGE_PATH` and MongoDB regularly.
-- Review Git history before making an existing private repository public.
+- 不要提交 `.env` 文件。
+- 使用足够长的随机 `ACCESS_TOKEN`。
+- 生产环境请使用 HTTPS/WSS。
+- 定期备份 `STORAGE_PATH` 和 MongoDB。
+- 将已有私有仓库公开前，请先检查 Git 历史。
 
-## Open Source
+## 开源协议
 
-ClawMd Hub is fully open source under the MIT License. You can use, copy, modify, distribute, sublicense, and use it commercially for free, as long as the MIT license notice is preserved.
+ClawMd Hub 基于 MIT License 完全开源。你可以免费使用、复制、修改、分发、再授权，也可以免费商用，只需要保留 MIT 协议声明。
 
-The software is provided as-is without warranty. Keep private configuration, secrets, sync data, database dumps, and personal notes out of public repositories.
+软件按现状提供，不附带任何担保。请不要把私有配置、密钥、同步数据、数据库备份和个人笔记提交到公开仓库。
 
 ## License
 
-[MIT](LICENSE)
+[MIT](../../LICENSE)
 
-## Friendly Links
+## 友情链接
 
 [Linux do](https://linux.do/)

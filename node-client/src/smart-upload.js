@@ -1,7 +1,13 @@
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
-async function buildUploadFile(RAY_PATH, filePath) {
+function normalizeUploadItem(item) {
+  return typeof item === 'string' ? { path: item } : item;
+}
+
+async function buildUploadFile(RAY_PATH, item) {
+  const uploadItem = normalizeUploadItem(item);
+  const filePath = uploadItem.path;
   const fullPath = path.join(RAY_PATH, filePath);
   const contentBuffer = await fs.readFile(fullPath);
   const stats = await fs.stat(fullPath);
@@ -12,9 +18,10 @@ async function buildUploadFile(RAY_PATH, filePath) {
     operation: 'create',
     hash: crypto.createHash('md5').update(contentBuffer).digest('hex'),
     mtime: stats.mtimeMs,
-    baseHash: null,
+    baseHash: uploadItem.baseHash || null,
+    baseRevision: uploadItem.baseRevision || 0,
     size: contentBuffer.length,
-    force: true
+    force: Boolean(uploadItem.force)
   };
 }
 function calculateStrategy(files, totalSizeMB) {
@@ -49,7 +56,8 @@ async function createBatches(files, RAY_PATH, batchSize, maxBatchSizeMB) {
   const batches = [];
   let currentBatch = [];
   let currentSizeMB = 0;
-  for (const filePath of files) {
+  for (const item of files) {
+    const filePath = normalizeUploadItem(item).path;
     let sizeMB = 0;
     try {
       const stats = await fs.stat(path.join(RAY_PATH, filePath));
@@ -64,7 +72,7 @@ async function createBatches(files, RAY_PATH, batchSize, maxBatchSizeMB) {
       currentBatch = [];
       currentSizeMB = 0;
     }
-    currentBatch.push(filePath);
+    currentBatch.push(item);
     currentSizeMB += sizeMB;
   }
   if (currentBatch.length > 0) {
@@ -75,7 +83,8 @@ async function createBatches(files, RAY_PATH, batchSize, maxBatchSizeMB) {
 async function smartUpload(filesToUpload, RAY_PATH, uploadFn, options = {}) {
   console.log('🧠 智能上传分析中...\n');
   let totalSizeMB = 0;
-  for (const filePath of filesToUpload) {
+  for (const item of filesToUpload) {
+    const filePath = normalizeUploadItem(item).path;
     try {
       const fullPath = path.join(RAY_PATH, filePath);
       const stats = await fs.stat(fullPath);
@@ -102,13 +111,14 @@ async function uploadSingle(files, RAY_PATH, uploadFn, concurrency, options) {
   const results = { succeeded: 0, failed: 0 };
   for (let i = 0; i < files.length; i += concurrency) {
     const batch = files.slice(i, i + concurrency);
-    const promises = batch.map(async (filePath) => {
+    const promises = batch.map(async (item) => {
+      const filePath = normalizeUploadItem(item).path;
       try {
-        await uploadFn([await buildUploadFile(RAY_PATH, filePath)]);
+        const result = await uploadFn([await buildUploadFile(RAY_PATH, item)]);
         results.succeeded++;
         uploaded++;
         if (options.onFileUploaded) {
-          await options.onFileUploaded(filePath);
+          await options.onFileUploaded(filePath, result.results && result.results[0]);
         }
         console.log(`   ✅ [${uploaded}/${files.length}] ${filePath}`);
       } catch (error) {
@@ -136,21 +146,24 @@ async function uploadBatch(files, RAY_PATH, uploadFn, strategy, options) {
       try {
         const batchFiles = [];
         let batchSizeMB = 0;
-        for (const filePath of batch) {
+        for (const item of batch) {
+          const filePath = normalizeUploadItem(item).path;
           try {
             const fullPath = path.join(RAY_PATH, filePath);
             const stats = await fs.stat(fullPath);
             const sizeMB = stats.size / 1024 / 1024;
-            batchFiles.push(await buildUploadFile(RAY_PATH, filePath));
+            batchFiles.push(await buildUploadFile(RAY_PATH, item));
             batchSizeMB += sizeMB;
           } catch (error) {
             console.error(`   ❌ 读取失败: ${filePath}`);
           }
         }
         const result = await uploadPreparedBatch(uploadFn, batchFiles);
-        if (options.onFileUploaded && result.succeeded === batchFiles.length) {
-          for (const file of batchFiles) {
-            await options.onFileUploaded(file.filePath);
+        if (options.onFileUploaded && result.results) {
+          for (const file of result.results) {
+            if (file.success) {
+              await options.onFileUploaded(file.filePath, file);
+            }
           }
         }
         batchFiles.length = 0;
@@ -191,13 +204,14 @@ async function uploadPreparedBatch(uploadFn, batchFiles) {
 }
 async function uploadSplitBatch(batch, RAY_PATH, uploadFn, options) {
   const results = { succeeded: 0, failed: 0 };
-  for (const filePath of batch) {
+  for (const item of batch) {
+    const filePath = normalizeUploadItem(item).path;
     try {
-      const result = await uploadPreparedBatch(uploadFn, [await buildUploadFile(RAY_PATH, filePath)]);
+      const result = await uploadPreparedBatch(uploadFn, [await buildUploadFile(RAY_PATH, item)]);
       results.succeeded += result.succeeded;
       results.failed += result.failed;
-      if (options.onFileUploaded && result.succeeded > 0) {
-        await options.onFileUploaded(filePath);
+      if (options.onFileUploaded && result.results && result.results[0] && result.results[0].success) {
+        await options.onFileUploaded(filePath, result.results[0]);
       }
     } catch (error) {
       results.failed++;

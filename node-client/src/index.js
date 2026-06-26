@@ -176,6 +176,42 @@ async function getServerFiles() {
   }
 }
 
+async function getServerManifest() {
+  const fetch = (await import('node-fetch')).default;
+
+  try {
+    const response = await fetch(`${HTTP_URL}/manifest?token=${encodeURIComponent(ACCESS_TOKEN)}`);
+
+    if (response.status === 404) {
+      console.warn('⚠️  服务器不支持 /manifest，降级使用 /files');
+      const files = await getServerFiles();
+      return {
+        files: files.map(file => ({
+          p: file.p || file.path,
+          h: file.h || file.hash,
+          s: file.s || file.size,
+          deleted: false,
+          r: file.r || file.revision || 0
+        })),
+        latestRevision: 0
+      };
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    return {
+      files: result.files || [],
+      latestRevision: result.latestRevision || 0
+    };
+  } catch (error) {
+    console.error('❌ 获取服务器 manifest 失败:', error.message);
+    throw error;
+  }
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -216,6 +252,71 @@ async function downloadFile(filePath) {
   }
 }
 
+async function removeLocalFile(filePath, revision = 0) {
+  const fullPath = path.join(RAY_PATH, filePath);
+  const safeTrashName = `${Date.now()}-${filePath.split(path.sep).join('__')}`;
+  const trashPath = path.join(
+    RAY_PATH,
+    '.clawmd-hub-trash',
+    safeTrashName
+  );
+
+  syncingFiles.add(fullPath);
+
+  try {
+    await fs.mkdir(path.dirname(trashPath), { recursive: true });
+    await fs.rename(fullPath, trashPath);
+    localDb.markFileDeleted(filePath, revision);
+    console.log(`🗑️  已按服务器删除状态移入本地回收站: ${filePath}`);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      localDb.markFileDeleted(filePath, revision);
+      return;
+    }
+    throw error;
+  } finally {
+    setTimeout(() => syncingFiles.delete(fullPath), REMOTE_WRITE_SUPPRESS_MS);
+  }
+}
+
+async function writeDownloadedFile(filePath, content, serverFile) {
+  const fullPath = path.join(RAY_PATH, filePath);
+
+  syncingFiles.add(fullPath);
+
+  try {
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, content);
+    const hash = await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+    localDb.upsertFile({
+      path: filePath,
+      size: serverFile.s || serverFile.size || content.length,
+      mtime: (await fs.stat(fullPath)).mtimeMs,
+      hash,
+      syncStatus: 'synced',
+      lastSyncedHash: serverFile.h || serverFile.hash || hash,
+      lastSyncedRevision: serverFile.r || serverFile.revision || 0
+    });
+  } finally {
+    setTimeout(() => syncingFiles.delete(fullPath), REMOTE_WRITE_SUPPRESS_MS);
+  }
+}
+
+async function createLocalConflictCopy(filePath) {
+  const fullPath = path.join(RAY_PATH, filePath);
+  const parsed = path.parse(filePath);
+  const conflictPath = path.join(
+    parsed.dir,
+    `${parsed.name}-local-conflict-${DEVICE_ID}-${Date.now()}${parsed.ext}`
+  );
+  const fullConflictPath = path.join(RAY_PATH, conflictPath);
+
+  await fs.mkdir(path.dirname(fullConflictPath), { recursive: true });
+  await fs.copyFile(fullPath, fullConflictPath);
+  console.log(`⚠️  本地与服务器同时变化，已保留本地冲突副本: ${conflictPath}`);
+  return conflictPath;
+}
+
 async function startInitialSync() {
   if (fullSyncRunning) {
     pendingFullSync = true;
@@ -231,23 +332,26 @@ async function startInitialSync() {
     console.log(`💾 本地索引: ${localIndexInitialized ? '已初始化' : '首次建立'}`);
     console.log(`   已记录 ${localDb.countFiles()} 个文件状态\n`);
 
-    console.log('📋 获取服务器文件列表...');
-    let serverFiles;
+    console.log('📋 获取服务器 manifest...');
+    let serverManifest;
     try {
-      serverFiles = await getServerFiles();
+      serverManifest = await getServerManifest();
     } catch (error) {
-      console.error('❌ 首次同步中止：无法确认服务器文件列表，避免误判为云端空数据');
+      console.error('❌ 首次同步中止：无法确认服务器状态，避免误判为云端空数据');
       return;
     }
 
+    const serverFiles = serverManifest.files || [];
     const serverFileMap = new Map(serverFiles.map(f => [
       f.p || f.path,
       {
         hash: f.h || f.hash,
-        size: f.s || f.size
+        size: f.s || f.size,
+        deleted: Boolean(f.deleted),
+        revision: f.r || f.revision || 0
       }
     ]));
-    console.log(`📋 服务器已有 ${serverFiles.length} 个文件\n`);
+    console.log(`📋 服务器已有 ${serverFiles.length} 条状态记录\n`);
 
     const localIndex = await buildLocalIndex(RAY_PATH, ignoreRules, localDb, {
       concurrency: LOCAL_SCAN_CONCURRENCY,
@@ -258,13 +362,19 @@ async function startInitialSync() {
 
     console.log('🔍 对比本地与服务器文件...');
     const filesToUpload = [];
+    const filesToDownload = [];
+    const filesToDelete = [];
+    const conflictsToDownload = [];
 
     for (const localFile of localFiles) {
       try {
         const serverFile = serverFileMap.get(localFile.path);
+        const cached = localDb.getFile(localFile.path);
+        const baseHash = cached ? cached.last_synced_hash : null;
+        const baseRevision = cached ? cached.last_synced_revision : 0;
 
-        if (!serverFile || localFile.hash !== serverFile.hash) {
-          filesToUpload.push(localFile.path);
+        if (!serverFile) {
+          filesToUpload.push({ path: localFile.path, baseHash, baseRevision });
           localDb.upsertFile({
             path: localFile.path,
             size: localFile.size,
@@ -272,14 +382,32 @@ async function startInitialSync() {
             hash: localFile.hash,
             syncStatus: 'pending_upload'
           });
-        } else {
+        } else if (serverFile.deleted) {
+          if (baseRevision > 0 || baseHash) {
+            filesToDelete.push({ path: localFile.path, revision: serverFile.revision });
+          } else {
+            filesToUpload.push({ path: localFile.path, baseHash, baseRevision });
+          }
+        } else if (localFile.hash === serverFile.hash) {
           localDb.upsertFile({
             path: localFile.path,
             size: localFile.size,
             mtime: localFile.mtime,
             hash: localFile.hash,
-            syncStatus: 'synced'
+            syncStatus: 'synced',
+            lastSyncedHash: serverFile.hash,
+            lastSyncedRevision: serverFile.revision
           });
+        } else if (baseHash && baseHash === localFile.hash) {
+          filesToDownload.push({ path: localFile.path, serverFile });
+        } else if (baseHash && baseHash === serverFile.hash) {
+          filesToUpload.push({
+            path: localFile.path,
+            baseHash,
+            baseRevision
+          });
+        } else {
+          conflictsToDownload.push({ path: localFile.path, serverFile });
         }
       } catch (error) {
       }
@@ -287,17 +415,21 @@ async function startInitialSync() {
 
     console.log(`\n💾 已更新 SQLite 索引 (缓存命中: ${localIndex.cached}, 重新计算: ${localIndex.calculated})\n`);
 
-    const filesToDownload = [];
-
     for (const serverFile of serverFiles) {
       const filePath = serverFile.p || serverFile.path;
-      if (filePath && !isIgnoredPath(filePath) && !localFileSet.has(filePath)) {
-        filesToDownload.push(filePath);
+      if (filePath && !isIgnoredPath(filePath) && !localFileSet.has(filePath) && !serverFile.deleted) {
+        filesToDownload.push({ path: filePath, serverFile: {
+          hash: serverFile.h || serverFile.hash,
+          size: serverFile.s || serverFile.size,
+          revision: serverFile.r || serverFile.revision || 0
+        }});
       }
     }
 
     console.log(`📤 需要上传: ${filesToUpload.length} 个文件`);
     console.log(`📥 需要下载: ${filesToDownload.length} 个文件`);
+    console.log(`🗑️  需要按服务器删除: ${filesToDelete.length} 个文件`);
+    console.log(`⚠️  需要生成冲突副本: ${conflictsToDownload.length} 个文件`);
     console.log(`✅ 已同步: ${localFiles.length - filesToUpload.length} 个文件\n`);
 
     let downloaded = 0;
@@ -305,15 +437,11 @@ async function startInitialSync() {
     if (filesToDownload.length > 0) {
       console.log('📥 开始下载文件...\n');
 
-      for (const filePath of filesToDownload) {
+      for (const item of filesToDownload) {
+        const filePath = item.path;
         try {
           const content = await downloadFile(filePath);
-          const fullPath = path.join(RAY_PATH, filePath);
-
-          await fs.mkdir(path.dirname(fullPath), { recursive: true });
-
-          await fs.writeFile(fullPath, content);
-          await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+          await writeDownloadedFile(filePath, content, item.serverFile);
 
           downloaded++;
 
@@ -329,15 +457,53 @@ async function startInitialSync() {
       console.log(`\n✅ 下载完成！共下载 ${downloaded}/${filesToDownload.length} 个文件\n`);
     }
 
+    for (const item of conflictsToDownload) {
+      try {
+        await createLocalConflictCopy(item.path);
+        const content = await downloadFile(item.path);
+        await writeDownloadedFile(item.path, content, item.serverFile);
+      } catch (error) {
+        console.error(`❌ 冲突处理失败: ${item.path}`, error.message);
+      }
+    }
+
+    for (const item of filesToDelete) {
+      try {
+        await removeLocalFile(item.path, item.revision);
+      } catch (error) {
+        console.error(`❌ 本地删除失败: ${item.path}`, error.message);
+      }
+    }
+
     if (filesToUpload.length > 0) {
      try {
-       await smartUpload(filesToUpload, RAY_PATH, uploadFilesHTTP, {
-         onFileUploaded: async (filePath) => {
-           try {
-             await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
-           } catch (error) {
-             console.error(`⚠️  更新本地索引失败: ${filePath}`, error.message);
-           }
+	       await smartUpload(filesToUpload, RAY_PATH, uploadFilesHTTP, {
+	         onFileUploaded: async (filePath, result) => {
+	           try {
+	             const hash = await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+	             const stats = await fs.stat(path.join(RAY_PATH, filePath));
+	             if (result && result.conflict) {
+	               localDb.upsertFile({
+	                 path: filePath,
+	                 size: stats.size,
+	                 mtime: stats.mtimeMs,
+	                 hash,
+	                 syncStatus: 'conflict'
+	               });
+	               return;
+	             }
+	             localDb.upsertFile({
+	               path: filePath,
+	               size: stats.size,
+	               mtime: stats.mtimeMs,
+	               hash,
+	               syncStatus: 'synced',
+	               lastSyncedHash: hash,
+	               lastSyncedRevision: result && result.revision ? result.revision : 0
+	             });
+	           } catch (error) {
+	             console.error(`⚠️  更新本地索引失败: ${filePath}`, error.message);
+	           }
          }
        });
      } catch (error) {
@@ -401,7 +567,7 @@ socket.on('registered', (data) => {
 });
 
 socket.on('file:update', async (data) => {
-  const { filePath, operation, content, fromDevice, hash, size } = data;
+  const { filePath, operation, content, fromDevice, hash, size, revision } = data;
   
   if (fromDevice === DEVICE_ID) {
     return;
@@ -426,7 +592,7 @@ socket.on('file:update', async (data) => {
           throw error;
         }
       }
-      localDb.markFileDeleted(filePath);
+      localDb.markFileDeleted(filePath, revision || 0);
       console.log(`🗑️  已删除: ${filePath}`);
     } else {
       const cached = localDb.getFile(filePath);
@@ -437,7 +603,9 @@ socket.on('file:update', async (data) => {
           size: size || cached.size,
           mtime: cached.mtime,
           hash,
-          syncStatus: 'synced'
+          syncStatus: 'synced',
+          lastSyncedHash: hash,
+          lastSyncedRevision: revision || cached.last_synced_revision || 0
         });
         return;
       }
@@ -447,7 +615,17 @@ socket.on('file:update', async (data) => {
         const dir = path.dirname(fullPath);
         await fs.mkdir(dir, { recursive: true });
         await fs.writeFile(fullPath, latestContent);
-        await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+        const newHash = await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+        const stats = await fs.stat(fullPath);
+        localDb.upsertFile({
+          path: filePath,
+          size: size || stats.size,
+          mtime: stats.mtimeMs,
+          hash: newHash,
+          syncStatus: 'synced',
+          lastSyncedHash: hash || newHash,
+          lastSyncedRevision: revision || 0
+        });
         console.log(`💾 已保存: ${filePath}`);
       } catch (error) {
         console.error(`❌ 下载失败，使用通知中的内容: ${filePath}`);
@@ -457,9 +635,19 @@ socket.on('file:update', async (data) => {
           const fallbackContent = data.contentEncoding === 'base64'
             ? Buffer.from(content, 'base64')
             : Buffer.from(content, 'utf8');
-          await fs.writeFile(fullPath, fallbackContent);
-          await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
-          console.log(`💾 已保存（降级）: ${filePath}`);
+	          await fs.writeFile(fullPath, fallbackContent);
+	          const newHash = await updateLocalDbFromPath(RAY_PATH, localDb, filePath, 'synced');
+	          const stats = await fs.stat(fullPath);
+	          localDb.upsertFile({
+	            path: filePath,
+	            size: size || stats.size,
+	            mtime: stats.mtimeMs,
+	            hash: newHash,
+	            syncStatus: 'synced',
+	            lastSyncedHash: hash || newHash,
+	            lastSyncedRevision: revision || 0
+	          });
+	          console.log(`💾 已保存（降级）: ${filePath}`);
         }
       }
     }
@@ -595,14 +783,22 @@ async function handleFileChange(fullPath, operation) {
 
   try {
     if (operation === 'delete') {
+      const cached = localDb.getFile(relativePath);
       const result = await uploadFilesHTTP([{
         filePath: relativePath,
-        operation: 'delete'
+        operation: 'delete',
+        baseRevision: cached ? cached.last_synced_revision : 0,
+        deviceId: DEVICE_ID
       }]);
       
       if (result.succeeded > 0) {
-        localDb.markFileDeleted(relativePath);
-        console.log(`✅ 删除已同步: ${relativePath}`);
+        const fileResult = result.results && result.results[0];
+        if (fileResult && fileResult.conflict) {
+          console.log(`⚠️  服务器版本已变化，跳过删除同步: ${relativePath}`);
+        } else {
+          localDb.markFileDeleted(relativePath, fileResult && fileResult.revision ? fileResult.revision : 0);
+          console.log(`✅ 删除已同步: ${relativePath}`);
+        }
       }
     } else {
       const contentBuffer = await fs.readFile(fullPath);
@@ -623,26 +819,38 @@ async function handleFileChange(fullPath, operation) {
         return;
       }
       
-      socket.emit('file:changed', {
-        filePath: relativePath,
-        operation,
-        content: contentBuffer.toString('base64'),
-        contentEncoding: 'base64',
-        hash,
-        size: stats.size,
-        mtime: stats.mtimeMs,
-        deviceId: DEVICE_ID
-      });
+	      const uploadResult = await uploadFilesHTTP([{
+	        filePath: relativePath,
+	        operation,
+	        content: contentBuffer.toString('base64'),
+	        contentEncoding: 'base64',
+	        hash,
+	        size: stats.size,
+	        mtime: stats.mtimeMs,
+	        baseHash: cached ? cached.last_synced_hash : null,
+	        baseRevision: cached ? cached.last_synced_revision : 0,
+	        deviceId: DEVICE_ID
+	      }]);
 
-      localDb.upsertFile({
-        path: relativePath,
-        size: stats.size,
-        mtime: stats.mtimeMs,
-        hash,
-        syncStatus: 'synced'
-      });
+	      const fileResult = uploadResult.results && uploadResult.results[0];
 
-      console.log(`📤 已发送: ${relativePath}`);
+	      localDb.upsertFile({
+	        path: relativePath,
+	        size: stats.size,
+	        mtime: stats.mtimeMs,
+	        hash,
+	        syncStatus: fileResult && fileResult.conflict ? 'conflict' : 'synced',
+	        lastSyncedHash: fileResult && fileResult.conflict ? cached && cached.last_synced_hash : hash,
+	        lastSyncedRevision: fileResult && fileResult.revision
+	          ? fileResult.revision
+	          : cached && cached.last_synced_revision
+	      });
+
+	      if (fileResult && fileResult.conflict) {
+	        console.log(`⚠️  已创建冲突副本，未覆盖服务器原文件: ${relativePath}`);
+	      } else {
+	        console.log(`📤 已上传: ${relativePath}`);
+	      }
     }
   } catch (error) {
     console.error(`❌ 处理失败: ${relativePath}`, error.message);
